@@ -1,195 +1,343 @@
-from typing import Dict, List, Protocol
-from collections import defaultdict
+from typing import Dict, List, Callable, Any, Optional
+from collections import defaultdict, deque
 import threading
 import time
+from dataclasses import dataclass
 
-from models.motor_model import DCMotor12V, MotorState
-
-
-# =====================================================
-# CONTRACT (REMOVES IDE + TYPE ISSUES FOREVER)
-# =====================================================
-class MotorContract(Protocol):
-    state: MotorState
-    voltage: float
-    current: float
-    speed: int
-    temperature: float
-    efficiency: float
-    faults: List
-
-    def power_on(self): ...
-    def power_off(self): ...
-    def start(self): ...
-    def stop(self): ...
-    def emergency_stop(self): ...
-    def update(self, voltage, current, speed, temperature): ...
-    def status(self) -> dict: ...
-    def _log(self, msg: str, level: str = "info"): ...
+from models.motor_model import DCMotor12V, MotorState, FaultType
 
 
 # =====================================================
-# SERVICE LAYER (IMPROVED)
+# EVENT SYSTEM
 # =====================================================
-class MotorService:
+@dataclass
+class MotorEvent:
+    motor_id: str
+    event_type: str
+    payload: Dict[str, Any]
+    timestamp: float
+
+
+# =====================================================
+# RULE ENGINE (SAFETY + VALIDATION)
+# =====================================================
+class RuleEngine:
     """
-    Industrial-grade Motor Service Layer
-
-    Improvements:
-    ─────────────────────────────
-    - Strong contract typing (Protocol)
-    - Thread-safe motor operations
-    - Safe state transitions
-    - Better fault aggregation
-    - Monitoring-ready architecture
+    Central safety validation engine.
+    All motor actions pass through here.
     """
 
     def __init__(self):
-        self.motors: Dict[str, MotorContract] = {}
+        self.rules: List[Callable[[DCMotor12V], Optional[str]]] = []
 
-        # global lock for atomic operations
+    def add_rule(self, rule: Callable[[DCMotor12V], Optional[str]]):
+        self.rules.append(rule)
+
+    def evaluate(self, motor: DCMotor12V) -> List[str]:
+        violations = []
+        for rule in self.rules:
+            result = rule(motor)
+            if result:
+                violations.append(result)
+        return violations
+
+
+# =====================================================
+# MOTOR SERVICE (FLEET CONTROLLER)
+# =====================================================
+class MotorService:
+    """
+    Fleet-level motor control system.
+
+    Responsibilities:
+    ─────────────────────────────────────────
+    1. Manage multiple motors (fleet)
+    2. Process ESP32 updates (high frequency)
+    3. Maintain real-time cache (low latency reads)
+    4. Async DB queue (batch persistence)
+    5. Rule-based safety system
+    6. Fault aggregation + system health
+    7. Event-driven architecture
+    8. Monitoring loop (SCADA-style)
+    """
+
+    def __init__(self):
+        # =========================
+        # REGISTRY
+        # =========================
+        self.motors: Dict[str, DCMotor12V] = {}
+
+        # =========================
+        # THREAD SAFETY
+        # =========================
         self.lock = threading.Lock()
 
-        self.running = False
+        # =========================
+        # CACHE (FAST READ LAYER)
+        # =========================
+        self.cache: Dict[str, Dict] = {}
+
+        # =========================
+        # DB QUEUE (ASYNC WRITE)
+        # =========================
+        self.db_queue = deque(maxlen=5000)
+
+        # =========================
+        # EVENT SUBSCRIBERS
+        # =========================
+        self.subscribers: List[Callable[[MotorEvent], None]] = []
+
+        # =========================
+        # RULE ENGINE
+        # =========================
+        self.rules = RuleEngine()
+
+        # =========================
+        # MONITORING
+        # =========================
+        self.monitoring = False
+
+        # =========================
+        # FLEET HEALTH
+        # =========================
+        self.fleet_health_score = 100.0
+
+        # =========================
+        # FAULT AGGREGATION
+        # =========================
+        self.global_faults = defaultdict(int)
+
+        # =========================
+        # HISTORY STORAGE (LIGHTWEIGHT)
+        # =========================
+        self.history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+
+        # =========================
+        # INIT DEFAULT RULES
+        # =========================
+        self._init_default_rules()
 
     # =====================================================
-    # REGISTRATION
+    # RULES SETUP
     # =====================================================
-    def register_motor(self, motor_id: str, motor: MotorContract):
+    def _init_default_rules(self):
+
+        # Voltage safety
+        self.rules.add_rule(
+            lambda m: "LOW_VOLTAGE" if m.voltage < 10 and m.running else None
+        )
+
+        # Thermal safety
+        self.rules.add_rule(
+            lambda m: "OVERHEAT" if m.temperature > 80 else None
+        )
+
+        # Current spike
+        self.rules.add_rule(
+            lambda m: "OVERCURRENT" if m.current > m.current_max else None
+        )
+
+        # Speed anomaly (stall detection)
+        self.rules.add_rule(
+            lambda m: "STALL" if m.running and m.speed < 30 and m.current > 3 else None
+        )
+
+        # Efficiency degradation
+        self.rules.add_rule(
+            lambda m: "LOW_EFFICIENCY" if m.efficiency < 40 else None
+        )
+
+    # =====================================================
+    # SUBSCRIPTIONS
+    # =====================================================
+    def subscribe(self, callback: Callable[[MotorEvent], None]):
+        self.subscribers.append(callback)
+
+    def _emit(self, motor_id: str, event_type: str, payload: Dict):
+        event = MotorEvent(motor_id, event_type, payload, time.time())
+
+        for sub in self.subscribers:
+            try:
+                sub(event)
+            except:
+                pass
+
+    # =====================================================
+    # MOTOR REGISTRATION
+    # =====================================================
+    def register_motor(self, motor_id: str, motor: DCMotor12V):
         with self.lock:
             self.motors[motor_id] = motor
+            self.cache[motor_id] = motor.status()
+
+        self._emit(motor_id, "REGISTERED", motor.status())
 
     def remove_motor(self, motor_id: str):
         with self.lock:
             self.motors.pop(motor_id, None)
+            self.cache.pop(motor_id, None)
+
+        self._emit(motor_id, "REMOVED", {})
 
     # =====================================================
-    # LIFECYCLE CONTROL (ATOMIC SAFE)
+    # LIFECYCLE CONTROL
     # =====================================================
     def power_on(self, motor_id: str):
-        with self.lock:
-            self._get_motor(motor_id).power_on()
+        m = self._get(motor_id)
+        m.power_on()
+        self._emit(motor_id, "POWER_ON", m.status())
 
     def power_off(self, motor_id: str):
-        with self.lock:
-            self._get_motor(motor_id).power_off()
+        m = self._get(motor_id)
+        m.power_off()
+        self._emit(motor_id, "POWER_OFF", m.status())
 
     def start_motor(self, motor_id: str):
-        with self.lock:
-            motor = self._get_motor(motor_id)
+        m = self._get(motor_id)
 
-            if self._is_safe_to_start(motor):
-                motor.start()
-            else:
-                motor._log("START BLOCKED (service safety gate)", level="warning")
+        if self._safe_to_start(m):
+            m.start()
+            self._emit(motor_id, "START", m.status())
+        else:
+            self._emit(motor_id, "START_BLOCKED", m.status())
 
     def stop_motor(self, motor_id: str):
-        with self.lock:
-            self._get_motor(motor_id).stop()
+        m = self._get(motor_id)
+        m.stop()
+        self._emit(motor_id, "STOP", m.status())
 
     def emergency_stop(self, motor_id: str):
-        with self.lock:
-            self._get_motor(motor_id).emergency_stop()
+        m = self._get(motor_id)
+        m.emergency_stop()
+        self._emit(motor_id, "EMERGENCY_STOP", m.status())
 
     # =====================================================
-    # SENSOR PIPELINE (LIGHTWEIGHT + SAFE)
+    # BATCH OPERATIONS (FLEET CONTROL)
+    # =====================================================
+    def start_all(self):
+        for mid in list(self.motors.keys()):
+            self.start_motor(mid)
+
+    def stop_all(self):
+        for mid in list(self.motors.keys()):
+            self.stop_motor(mid)
+
+    def emergency_stop_all(self):
+        for mid in list(self.motors.keys()):
+            self.emergency_stop(mid)
+
+    # =====================================================
+    # SENSOR UPDATE PIPELINE (ESP32 ENTRY POINT)
     # =====================================================
     def update_motor(self, motor_id: str, v: float, i: float, s: int, t: float):
-        motor = self._get_motor(motor_id)
+        m = self._get(motor_id)
 
-        if motor.state == MotorState.OFF:
+        # update model
+        m.update(v, i, s, t)
+
+        # cache update (FAST READ LAYER)
+        self.cache[motor_id] = m.status()
+
+        # history
+        self.history[motor_id].append(m.status())
+
+        # rule evaluation
+        violations = self.rules.evaluate(m)
+
+        if violations:
+            for v in violations:
+                self.global_faults[v] += 1
+                self._emit(motor_id, "RULE_VIOLATION", {"rule": v})
+
+        # DB queue (ASYNC persistence)
+        self.db_queue.append(m.status())
+
+        # telemetry event
+        self._emit(motor_id, "UPDATE", m.status())
+
+    # =====================================================
+    # SAFE START LOGIC
+    # =====================================================
+    def _safe_to_start(self, m: DCMotor12V) -> bool:
+        if m.state == MotorState.FAULT:
+            return False
+        if m.temperature > 75:
+            return False
+        if m.voltage < 10:
+            return False
+        return True
+
+    # =====================================================
+    # MONITORING LOOP (SCADA STYLE)
+    # =====================================================
+    def start_monitoring(self, interval: float = 1.0):
+        if self.monitoring:
             return
 
-        motor.update(v, i, s, t)
+        self.monitoring = True
+        threading.Thread(target=self._monitor_loop, args=(interval,), daemon=True).start()
+
+    def _monitor_loop(self, interval: float):
+        while self.monitoring:
+            self._compute_fleet_health()
+            self._detect_fleet_anomalies()
+            time.sleep(interval)
 
     # =====================================================
-    # SMART SAFETY GATE (IMPROVED LOGIC)
+    # FLEET HEALTH ENGINE
     # =====================================================
-    def _is_safe_to_start(self, motor: MotorContract) -> bool:
-        """
-        Instead of hard thresholds only,
-        we use a weighted safety score idea.
-        """
+    def _compute_fleet_health(self):
+        if not self.motors:
+            self.fleet_health_score = 100
+            return
 
-        score = 100
+        total = 0
+        score = 0
 
-        # Fault penalty
-        score -= len(motor.faults) * 25
+        for m in self.motors.values():
+            total += 1
+            score += m.get_health_score()
 
-        # Thermal penalty
-        if motor.temperature > 80:
-            score -= 50
-        elif motor.temperature > 70:
-            score -= 20
+        self.fleet_health_score = score / total
 
-        # Voltage penalty
-        if motor.voltage < 10:
-            score -= 40
+    # =====================================================
+    # ANOMALY DETECTION (FLEET LEVEL)
+    # =====================================================
+    def _detect_fleet_anomalies(self):
+        for mid, m in self.motors.items():
 
-        # Efficiency penalty
-        if motor.efficiency < 50:
-            score -= 20
+            if m.state == MotorState.RUNNING and m.speed < 20:
+                self._emit(mid, "STALL_WARNING", m.status())
 
-        return score >= 60
+            if m.temperature > 85:
+                self._emit(mid, "THERMAL_WARNING", m.status())
+
+            if m.efficiency < 35:
+                self._emit(mid, "EFFICIENCY_CRITICAL", m.status())
 
     # =====================================================
     # STATUS APIs
     # =====================================================
-    def get_motor_status(self, motor_id: str) -> Dict:
-        return self._get_motor(motor_id).status()
+    def get_motor_status(self, motor_id: str):
+        return self.cache.get(motor_id)
 
-    def get_all_status(self) -> Dict[str, Dict]:
-        return {mid: m.status() for mid, m in self.motors.items()}
+    def get_all_status(self):
+        return self.cache
 
-    # =====================================================
-    # FAULT ANALYTICS (IMPROVED)
-    # =====================================================
-    def get_all_faults(self) -> Dict[str, List]:
-        return {mid: m.faults for mid, m in self.motors.items()}
+    def get_fleet_health(self):
+        return {
+            "fleet_health": self.fleet_health_score,
+            "motor_count": len(self.motors),
+            "faults": dict(self.global_faults),
+        }
 
-    def get_fault_summary(self) -> Dict:
-        summary = defaultdict(int)
-
-        for motor in self.motors.values():
-            for f in motor.faults:
-                summary[f.value] += 1
-
-        return dict(summary)
+    def get_motor_history(self, motor_id: str):
+        return list(self.history[motor_id])
 
     # =====================================================
-    # MONITORING LOOP (NON-BLOCKING READY)
+    # UTIL
     # =====================================================
-    def run_monitoring_loop(self, interval: float = 1.0):
-        self.running = True
-
-        while self.running:
-            with self.lock:
-                for motor in self.motors.values():
-                    self._health_check(motor)
-
-            time.sleep(interval)
-
-    def stop_monitoring(self):
-        self.running = False
-
-    # =====================================================
-    # HEALTH OVERSIGHT (SERVICE INTELLIGENCE)
-    # =====================================================
-    def _health_check(self, motor: MotorContract):
-
-        if motor.efficiency < 40:
-            motor._log("SERVICE: critical efficiency drop", "warning")
-
-        if motor.state == MotorState.RUNNING and motor.speed < 30:
-            motor._log("SERVICE: stall trend detected", "warning")
-
-        if motor.temperature > 85:
-            motor._log("SERVICE: thermal stress high", "warning")
-
-    # =====================================================
-    # INTERNAL
-    # =====================================================
-    def _get_motor(self, motor_id: str) -> MotorContract:
+    def _get(self, motor_id: str) -> DCMotor12V:
         if motor_id not in self.motors:
-            raise ValueError(f"Motor '{motor_id}' not registered")
+            raise ValueError(f"Motor {motor_id} not found")
         return self.motors[motor_id]
