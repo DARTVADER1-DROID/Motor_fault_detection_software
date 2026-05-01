@@ -1,852 +1,484 @@
 from enum import Enum
 from collections import deque
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 # =========================
-# FSM STATES (DC MOTOR)
+# MOTOR STATES
 # =========================
 class MotorState(Enum):
-    """Motor operational states for 12V brushed DC motor"""
-    OFFLINE = "OFFLINE"              # Motor powered off, safe state
-    IDLE = "IDLE"                    # Power on, motor stationary (startup preparation)
-    ACCELERATING = "ACCELERATING"    # Speed ramping up from idle
-    RUNNING = "RUNNING"              # Nominal operation, stable speed
-    DECELERATING = "DECELERATING"    # Speed ramping down before stop
-    STALLED = "STALLED"              # Motor locked, high current
-    OVERHEATING = "OVERHEATING"      # Thermal warning, continue with caution
-    FAULT = "FAULT"                  # Critical abnormality, requires intervention
-    SHUTDOWN = "SHUTDOWN"            # Controlled emergency stop
+    """Simple, practical states for 12V DC motor"""
+    OFF = "OFF"                    # No power
+    IDLE = "IDLE"                  # Power on, stationary
+    RUNNING = "RUNNING"            # Motor spinning normally
+    FAULT = "FAULT"                # Critical issue, stop needed
 
 
 # =========================
-# FAULT TYPES (BRUSHED DC)
+# FAULT TYPES
 # =========================
 class FaultType(Enum):
-    """Fault conditions specific to brushed DC motors"""
-    # CRITICAL FAULTS (Stop immediately)
-    STALL_CONDITION = "STALL_CONDITION"              # High current, zero/near-zero speed
-    THERMAL_RUNAWAY = "THERMAL_RUNAWAY"              # Temperature >90°C
-    WINDING_SHORT = "WINDING_SHORT"                  # Abnormally high current at normal speed
-    EXCESSIVE_BRUSH_WEAR = "EXCESSIVE_BRUSH_WEAR"   # High ripple current + low speed
-    VOLTAGE_COLLAPSE = "VOLTAGE_COLLAPSE"            # Supply voltage dropped dangerously
+    """Practical faults for 12V brushed DC"""
+    # Critical - must stop
+    STALL = "STALL"                        # High current + zero/very low speed
+    THERMAL_RUNAWAY = "THERMAL_RUNAWAY"    # Temp > 90°C
+    WINDING_SHORT = "WINDING_SHORT"        # High current but very low back-EMF
     
-    # SEVERE FAULTS (Escalate quickly)
-    OVERHEAT_WARNING = "OVERHEAT_WARNING"            # Temperature 70-90°C
-    HIGH_CURRENT_SPIKE = "HIGH_CURRENT_SPIKE"       # Transient overcurrent
-    VOLTAGE_INSTABILITY = "VOLTAGE_INSTABILITY"      # Voltage fluctuation >2V
-    BACK_EMF_ANOMALY = "BACK_EMF_ANOMALY"           # Calculated back-EMF inconsistency
+    # Severe - escalate
+    OVERHEAT = "OVERHEAT"                  # Temp 75-90°C
+    HIGH_CURRENT = "HIGH_CURRENT"          # Current spike > 6.5A
+    VOLTAGE_DROP = "VOLTAGE_DROP"          # Supply voltage too low (< 10V)
     
-    # WARNING FAULTS (Monitor and log)
-    REDUCED_EFFICIENCY = "REDUCED_EFFICIENCY"        # Efficiency drops below 40%
-    ABNORMAL_ACCELERATION = "ABNORMAL_ACCELERATION"  # Slow ramp-up (friction/wear)
-    CURRENT_RIPPLE_HIGH = "CURRENT_RIPPLE_HIGH"     # High current variance (commutator wear)
-    THERMAL_DRIFT = "THERMAL_DRIFT"                 # Steady temp increase trend
+    # Warning - monitor
+    LOW_EFFICIENCY = "LOW_EFFICIENCY"      # Efficiency < 50% (bearing friction)
+    BRUSH_WEAR = "BRUSH_WEAR"              # High current ripple (poor commutation)
 
 
-class FaultSeverity(Enum):
-    """Fault severity classification"""
-    CRITICAL = 3   # Immediate shutdown required
-    SEVERE = 2     # Escalate within 2-3 cycles
-    WARNING = 1    # Log and monitor
-
-
-# =========================
-# FAULT SEVERITY MAPPING
-# =========================
-FAULT_SEVERITY_MAP = {
-    FaultType.STALL_CONDITION: FaultSeverity.CRITICAL,
-    FaultType.THERMAL_RUNAWAY: FaultSeverity.CRITICAL,
-    FaultType.WINDING_SHORT: FaultSeverity.CRITICAL,
-    FaultType.EXCESSIVE_BRUSH_WEAR: FaultSeverity.CRITICAL,
-    FaultType.VOLTAGE_COLLAPSE: FaultSeverity.CRITICAL,
-    
-    FaultType.OVERHEAT_WARNING: FaultSeverity.SEVERE,
-    FaultType.HIGH_CURRENT_SPIKE: FaultSeverity.SEVERE,
-    FaultType.VOLTAGE_INSTABILITY: FaultSeverity.SEVERE,
-    FaultType.BACK_EMF_ANOMALY: FaultSeverity.SEVERE,
-    
-    FaultType.REDUCED_EFFICIENCY: FaultSeverity.WARNING,
-    FaultType.ABNORMAL_ACCELERATION: FaultSeverity.WARNING,
-    FaultType.CURRENT_RIPPLE_HIGH: FaultSeverity.WARNING,
-    FaultType.THERMAL_DRIFT: FaultSeverity.WARNING,
-}
-
-
-# =========================
-# LOAD CONDITIONS
-# =========================
-class LoadCondition(Enum):
-    """Motor load classification"""
-    LIGHT = "LIGHT"          # 0-20% current
-    MODERATE = "MODERATE"    # 20-50% current
-    NOMINAL = "NOMINAL"      # 50-80% current
-    HEAVY = "HEAVY"          # 80-100% current
-
-
-class DCMotor:
+class DCMotor12V:
     """
-    Bulletproof 12V Brushed DC Motor Control Model
-    ──────────────────────────────────────────────
+    12V Brushed DC Motor Control Model
+    ──────────────────────────────────
     
-    DESIGN FOR COLLEGE PROJECT:
-    • Sensors: Voltage, Current, Temperature, Speed only
-    • No load state considered as fault (light load = normal operation)
-    • Extensive derived metrics for monitoring
-    • Robust fault detection with persistence
-    • Deterministic FSM with hysteresis
-    • Real-time efficiency analysis
+    SIMPLE. PRACTICAL. COLLEGE-READY.
     
-    MOTOR SPECS (Typical 12V brushed):
-    • Nominal voltage: 12V
-    • Max continuous current: 5A (60W)
-    • Max torque: ~0.5-1.0 N⋅m
-    • Speed range: 0-3000 RPM
-    • Winding resistance: ~2.4Ω (R = V_no_load / I_no_load)
-    • No-load current: ~0.5A
-    • Thermal time constant: ~30-60 seconds
+    Sensors: V (voltage), I (current), T (temperature), N (RPM)
+    No load = Normal. Motor will mostly run at no-load.
+    
+    Derived quantities:
+    - Power (input, mechanical, loss)
+    - Efficiency
+    - Back-EMF & motor constant
+    - Torque estimate
+    - Current ripple (brush condition)
+    - Thermal analysis
     """
 
-    def __init__(self, name: str = "DC-Motor-1", update_rate: float = 10.0):
+    def __init__(self, name: str = "12V-Motor", update_rate: float = 10.0):
         """
-        Initialize 12V brushed DC motor with defensive defaults.
-        
         Args:
             name: Motor identifier
             update_rate: Control loop frequency (Hz)
         """
         self.name = name
         self.update_rate = update_rate
-        self.cycle_time = 1.0 / update_rate
 
         # =========================
-        # SENSOR INPUTS (RAW)
+        # SENSOR INPUTS
         # =========================
-        self.voltage = 12.0        # Supply voltage (V)
-        self.current = 0.0         # Motor current (A)
-        self.speed = 0             # Motor speed (RPM)
-        self.temperature = 25.0    # Winding temperature (°C)
+        self.voltage = 12.0        # V (supply voltage)
+        self.current = 0.0         # A (motor current)
+        self.speed = 0             # RPM (motor speed)
+        self.temperature = 25.0    # °C (winding temperature)
 
         # =========================
-        # DERIVED METRICS (COMPUTED)
+        # DERIVED QUANTITIES
         # =========================
-        # Power & Energy
-        self.power_input = 0.0     # Input power: V × I (W)
-        self.power_loss = 0.0      # Loss power: I²R + friction (W)
-        self.power_mechanical = 0.0  # Mechanical output power (W)
-        self.efficiency = 0.0      # η = P_mech / P_input (%)
-        
+        # Power
+        self.power_input = 0.0          # W (V × I)
+        self.power_loss = 0.0           # W (I²R + friction)
+        self.power_mechanical = 0.0     # W (output power)
+        self.efficiency = 0.0           # % (mechanical/input)
+
         # Back-EMF & Motor Constants
-        self.back_emf = 0.0        # Induced voltage (V)
-        self.back_emf_constant = 0.0  # Ke (V⋅s/rad) calculated per cycle
-        self.motor_constant = 0.0  # Km (N⋅m/A) estimated from data
-        
-        # Resistance & Current Analysis
-        self.winding_resistance = 2.4  # Ohms (nominal for 12V brushed)
-        self.resistive_loss = 0.0  # I²R losses (W)
-        self.speed_rate_of_change = 0.0  # dRPM/dt (RPM/s)
-        self.current_ripple = 0.0  # Current variance indicator (%)
-        self.current_smoothness = 0.0  # Inverse of ripple (0-1)
-        
-        # Thermal Analysis
-        self.thermal_power = 0.0   # Heat generation rate (W)
-        self.temp_rate_of_change = 0.0  # dT/dt (°C/s)
-        self.temp_rise_from_ambient = 0.0  # ΔT above 25°C baseline (°C)
-        self.heat_dissipation_rate = 0.0  # Estimated cooling rate (W)
-        
-        # Load & Operating Point
-        self.load_condition = LoadCondition.LIGHT
-        self.load_percentage = 0.0  # Normalized to max current (%)
-        self.speed_percentage = 0.0  # Normalized to max speed (%)
-        self.duty_cycle = 0.0       # V / V_nominal (%)
-        
-        # Torque Estimation
-        self.estimated_torque = 0.0  # N⋅m (from Km × I)
-        self.estimated_mechanical_power = 0.0  # W (from τ × ω)
+        self.back_emf = 0.0             # V (calculated)
+        self.ke = 0.0                   # Back-EMF constant (V⋅s/rad)
+        self.km = 0.075                 # Torque constant (N⋅m/A) - standard for 12V
+
+        # Load & Speed
+        self.speed_pct = 0.0            # % of max (3000 RPM nominal)
+        self.load_pct = 0.0             # % based on current (0-5A = 0-100%)
+        self.torque = 0.0               # N⋅m (estimated)
+
+        # Current Analysis
+        self.current_ripple = 0.0       # % (variance indicator)
+        self.current_avg = 0.0          # A (moving average)
+
+        # Thermal
+        self.temp_rise = 0.0            # °C (above 25°C ambient)
+        self.temp_rise_rate = 0.0       # °C/s (rate of change)
 
         # =========================
-        # FSM STATE
+        # MOTOR SPECS (12V brushed typical)
         # =========================
-        self.state = MotorState.OFFLINE
-        self.previous_state = MotorState.OFFLINE
-        self.state_entry_time = time.time()
+        self.R = 2.4                    # Ohms (winding resistance, from datasheet)
+        self.rpm_max = 3000             # RPM (no-load max speed)
+        self.current_nominal = 4.0      # A (rated continuous current)
+        self.current_max = 6.5          # A (absolute max safe)
+
+        # =========================
+        # STATE MACHINE
+        # =========================
+        self.state = MotorState.OFF
+        self.running = False
         self.powered_on = False
         self.command_start = False
         self.command_stop = False
-        self.acceleration_phase_time = 0.0
+        self.state_entry_time = time.time()
 
         # =========================
-        # SPEED TRACKING (For ramp detection)
+        # HISTORY (for ripple, trends)
         # =========================
-        self.speed_history = deque(maxlen=10)  # Last 10 speed samples
-        self.current_history = deque(maxlen=10)
-        self.temp_history = deque(maxlen=20)  # Last 20 temp samples for trend
-        self.voltage_history = deque(maxlen=10)  # Last 10 voltage samples
+        self.current_history = deque(maxlen=15)  # Last 15 current samples
+        self.speed_history = deque(maxlen=15)
+        self.temp_history = deque(maxlen=20)
 
         # =========================
-        # THRESHOLDS (12V Brushed DC Motor)
+        # FAULTS
+        # =========================
+        self.faults = []
+        self.fault_counts = {ft: 0 for ft in FaultType}  # Persistence tracking
+        self.fault_persistence_threshold = 3  # Must occur 3+ cycles to trigger
+
+        # =========================
+        # THRESHOLDS (tuned for 12V motor)
         # =========================
         self.thresholds = {
-            # VOLTAGE SAFETY (12V nominal, ±10% tolerance)
+            # Current (A)
+            "current_no_load": 0.5,      # Typical no-load current
+            "current_light": 1.5,        # Light load
+            "current_nominal": 4.0,      # Normal operating
+            "current_spike": 6.5,        # Hard limit
+            
+            # Speed (RPM)
+            "speed_min_running": 50,     # Motor considered "running"
+            "speed_nominal": 2500,       # Comfortable operating speed
+            
+            # Temperature (°C)
+            "temp_ambient": 25.0,
+            "temp_warning": 75.0,        # Warm
+            "temp_critical": 90.0,       # Dangerous
+            
+            # Voltage (V)
             "voltage_nominal": 12.0,
-            "voltage_min_safe": 10.8,    # -10% from nominal
-            "voltage_max_safe": 13.2,    # +10% from nominal
-            "voltage_critical_min": 9.0,  # Severe undervoltage
-            "voltage_critical_max": 14.4,  # Severe overvoltage
-            "voltage_change_threshold": 0.5,  # Instability detection
+            "voltage_low": 10.0,         # Too low, motor struggles
             
-            # CURRENT RANGES (Typical 12V 60W = 5A rated)
-            "current_no_load": 0.5,       # Idling current (friction)
-            "current_light_load": 1.5,    # <30% load
-            "current_moderate_load": 2.5,  # 30-50% load
-            "current_nominal_load": 4.0,   # 50-80% nominal operating range
-            "current_heavy_load": 5.0,    # 80-100% load
-            "current_stall": 5.5,         # Locked rotor current threshold
-            "current_max_safe": 6.5,      # Absolute maximum (hard limit)
-            "current_spike_detection": 1.5,  # Transient detection threshold above baseline
+            # Current ripple (%)
+            "ripple_healthy": 15.0,      # Good brush contact
+            "ripple_worn": 30.0,         # Worn brushes
             
-            # SPEED THRESHOLDS
-            "speed_nominal": 3000,        # Max speed @ 12V (RPM)
-            "speed_min_running": 100,     # Minimum speed to be considered "running"
-            "speed_stalled": 20,          # RPM below this = stalled
-            
-            # ACCELERATION CHARACTERISTICS
-            "acceleration_timeout": 5.0,   # Seconds to reach min speed (fault if exceeded)
-            "acceleration_ramp_min": 50.0, # Min RPM/s during startup (fault if slower)
-            
-            # TEMPERATURE (Thermal management)
-            "temp_ambient": 25.0,         # Baseline ambient
-            "temp_nominal_max": 70.0,     # Normal operating limit
-            "temp_warning": 75.0,         # Thermal warning threshold
-            "temp_critical": 90.0,        # Thermal runaway shutdown
-            "temp_hysteresis": 3.0,       # Prevent oscillation
-            "temp_rise_rate_max": 1.5,    # °C/second - early warning if faster
-            
-            # EFFICIENCY
-            "efficiency_min": 40.0,       # Below = reduced efficiency fault
-            "efficiency_nominal": 75.0,   # Expected @ 50-70% load
-            
-            # BACK-EMF
-            "back_emf_ratio_min": 0.7,    # Minimum Vb/V ratio (fault if lower)
-            "back_emf_ratio_max": 0.95,   # Maximum Vb/V ratio
-            
-            # CURRENT RIPPLE (Commutator condition)
-            "current_ripple_threshold": 30.0,  # % ripple - high = brush wear
-            
-            # THERMAL TIME CONSTANT
-            "thermal_time_constant": 45.0,  # Seconds (exponential heating model)
+            # Efficiency (%)
+            "efficiency_good": 70.0,     # Healthy
+            "efficiency_low": 50.0,      # Bearing friction/wear
         }
 
         # =========================
-        # FAULT SYSTEM
+        # LOGGING
         # =========================
-        self.faults: List[FaultType] = []
-        self.fault_history: Dict[FaultType, int] = {ft: 0 for ft in FaultType}
-        self.fault_persistence = 3  # Fault must occur 3+ cycles to trigger
-        self.critical_fault_detected = False
-        self.fault_recovery_timer = 0.0
-
-        # =========================
-        # EVENT LOG
-        # =========================
-        self.log: deque = deque(maxlen=500)
-        self._log("INITIALIZATION COMPLETE", level="info")
+        self.logs = deque(maxlen=300)
+        self._log("Initialized", level="info")
 
     # =====================================================
-    # COMMAND INTERFACE
+    # COMMANDS
     # =====================================================
-    def power_on(self) -> bool:
-        """Enable motor power supply"""
-        if self.state == MotorState.OFFLINE:
+    def power_on(self):
+        """Enable power supply"""
+        if not self.powered_on:
             self.powered_on = True
             self.state = MotorState.IDLE
-            self.state_entry_time = time.time()
-            self._log("Power supply ON → IDLE state", level="info")
-            return True
-        return False
+            self._log("Power ON", level="info")
 
-    def power_off(self) -> bool:
-        """Disable motor power supply"""
+    def power_off(self):
+        """Disable power supply"""
         self.powered_on = False
-        self.state = MotorState.OFFLINE
-        self.command_start = False
-        self.command_stop = False
-        self._log("Power supply OFF → OFFLINE state", level="info")
-        return True
+        self.running = False
+        self.state = MotorState.OFF
+        self._log("Power OFF", level="info")
 
-    def start_motor(self) -> bool:
-        """Request motor to start accelerating"""
-        if self.state in [MotorState.IDLE, MotorState.DECELERATING]:
+    def start(self):
+        """Command motor to run"""
+        if self.state == MotorState.IDLE:
             self.command_start = True
-            self.command_stop = False
-            self._log("START command received", level="info")
-            return True
-        return False
+            self._log("Start command", level="info")
 
-    def stop_motor(self) -> bool:
-        """Request smooth deceleration and stop"""
-        if self.state != MotorState.OFFLINE:
+    def stop(self):
+        """Command motor to stop"""
+        if self.running:
             self.command_stop = True
-            self.command_start = False
-            self._log("STOP command received", level="info")
-            return True
-        return False
+            self._log("Stop command", level="info")
 
-    def emergency_stop(self) -> bool:
-        """Force immediate shutdown"""
+    def emergency_stop(self):
+        """Force immediate stop"""
         self.powered_on = False
-        self.state = MotorState.SHUTDOWN
-        self.command_start = False
-        self.command_stop = True
-        self._log("⚠️  EMERGENCY STOP TRIGGERED", level="critical")
-        return True
+        self.running = False
+        self.state = MotorState.OFF
+        self.faults.append(FaultType.STALL)
+        self._log("⚠️  EMERGENCY STOP", level="critical")
 
     # =====================================================
-    # UPDATE CYCLE (MAIN ENTRY POINT)
+    # MAIN UPDATE CYCLE
     # =====================================================
     def update(self, voltage: float, current: float, speed: int, temperature: float):
         """
-        Execute one control cycle.
+        Single control cycle.
         
-        Pipeline:
-        1. Validate + clamp sensor inputs
-        2. Compute derived metrics
-        3. Update FSM state machine
-        4. Detect faults
-        5. Log events
+        Args:
+            voltage: Supply voltage (V)
+            current: Motor current (A)
+            speed: Motor speed (RPM)
+            temperature: Winding temperature (°C)
         """
-        # STEP 1: INPUT VALIDATION & DEFENSIVE CLAMPING
-        self._validate_and_clamp_inputs(voltage, current, speed, temperature)
+        # Validate inputs
+        self._validate_inputs(voltage, current, speed, temperature)
 
-        # STEP 2: DERIVED DATA COMPUTATION
-        self._compute_derived_metrics()
+        # Compute derived quantities
+        self._compute_metrics()
 
-        # STEP 3: HISTORY TRACKING
+        # Update history
         self._update_history()
 
-        # STEP 4: FSM STATE MACHINE
-        self._fsm_update()
+        # State machine
+        self._update_state()
 
-        # STEP 5: FAULT DETECTION
-        self._fault_engine()
+        # Fault detection
+        self._detect_faults()
 
-        # STEP 6: CRITICAL FAULT ESCALATION
-        if self.critical_fault_detected and self.state not in [MotorState.FAULT, MotorState.SHUTDOWN]:
-            self.state = MotorState.FAULT
-            self._log("🔴 FAULT STATE ESCALATED FROM CRITICAL CONDITION", level="critical")
-
-    def _validate_and_clamp_inputs(self, voltage: float, current: float, speed: int, temperature: float):
-        """Defensive input validation with safe fallback values"""
-        
-        # VOLTAGE: Allow range 0-20V, default to 12V if invalid
-        if isinstance(voltage, (int, float)) and -1 < voltage < 25:
+    def _validate_inputs(self, voltage: float, current: float, speed: int, temperature: float):
+        """Safe input validation"""
+        # Voltage
+        try:
             self.voltage = max(0.0, min(20.0, float(voltage)))
-        else:
-            self.voltage = self.thresholds["voltage_nominal"]
-            self._log(f"⚠️  VOLTAGE SENSOR INVALID: {voltage}, using nominal 12V", level="warning")
+        except:
+            self.voltage = 12.0
 
-        # CURRENT: Allow range 0-20A, default to 0A if invalid
-        if isinstance(current, (int, float)) and -0.5 < current < 25:
-            self.current = max(0.0, min(20.0, float(current)))
-        else:
+        # Current
+        try:
+            self.current = max(0.0, min(15.0, float(current)))
+        except:
             self.current = 0.0
-            self._log(f"⚠️  CURRENT SENSOR INVALID: {current}, using 0A", level="warning")
 
-        # SPEED: Integer RPM, clamp to valid range
-        if isinstance(speed, int) and -100 < speed < 4000:
+        # Speed
+        try:
             self.speed = max(0, min(3500, int(speed)))
-        else:
+        except:
             self.speed = 0
-            self._log(f"⚠️  SPEED SENSOR INVALID: {speed}, using 0 RPM", level="warning")
 
-        # TEMPERATURE: Reasonable range -10 to 150°C, default to ambient
-        if isinstance(temperature, (int, float)) and -20 < temperature < 160:
-            self.temperature = max(-10.0, min(150.0, float(temperature)))
-        else:
-            self.temperature = self.thresholds["temp_ambient"]
-            self._log(f"⚠️  TEMPERATURE SENSOR INVALID: {temperature}, using 25°C", level="warning")
-
-    def _update_history(self):
-        """Maintain sliding window history for trend analysis"""
-        self.speed_history.append(self.speed)
-        self.current_history.append(self.current)
-        self.temp_history.append(self.temperature)
-        self.voltage_history.append(self.voltage)
+        # Temperature
+        try:
+            self.temperature = max(-10.0, min(120.0, float(temperature)))
+        except:
+            self.temperature = 25.0
 
     # =====================================================
-    # DERIVED METRICS COMPUTATION (EXTENSIVE)
+    # COMPUTE DERIVED QUANTITIES
     # =====================================================
-    def _compute_derived_metrics(self):
-        """
-        Compute 14+ derived metrics from 4 sensor inputs.
-        All calculations are defensive: handle edge cases, avoid division by zero.
-        """
+    def _compute_metrics(self):
+        """Calculate all derived metrics from V, I, T, N"""
 
-        # ─────────────────────────────────────────────────
         # 1. POWER ANALYSIS
         # ─────────────────────────────────────────────────
-        
-        # Input power: P_in = V × I
         self.power_input = self.voltage * self.current
 
-        # Resistive loss: P_loss = I² × R (assuming 2.4Ω winding resistance)
-        self.resistive_loss = (self.current ** 2) * self.winding_resistance
+        # Resistive loss: I²R (Joule heating in winding)
+        i_squared_r = (self.current ** 2) * self.R
 
-        # Mechanical power: P_mech = P_in - P_loss
-        # (Simplified: assumes friction loss is proportional to speed)
-        friction_loss = max(0.0, 0.3 * self.power_input)  # ~30% at nominal load
-        self.power_mechanical = max(0.0, self.power_input - self.resistive_loss - friction_loss)
+        # Friction loss (bearing, air resistance)
+        # Rough estimate: 20% of input power at nominal load
+        friction_loss = max(0.0, 0.20 * self.power_input)
 
-        # Efficiency: η = P_mech / P_in (%)
+        self.power_loss = i_squared_r + friction_loss
+        self.power_mechanical = max(0.0, self.power_input - self.power_loss)
+
+        # Efficiency
         if self.power_input > 0.1:
-            self.efficiency = max(0.0, (self.power_mechanical / self.power_input) * 100.0)
+            self.efficiency = (self.power_mechanical / self.power_input) * 100.0
         else:
             self.efficiency = 0.0
 
+        # 2. BACK-EMF
         # ─────────────────────────────────────────────────
-        # 2. BACK-EMF & MOTOR CONSTANTS
-        # ─────────────────────────────────────────────────
+        # Back-EMF = V - I×R
+        self.back_emf = max(0.0, self.voltage - (self.current * self.R))
 
-        # Back-EMF: Vb = V - (I × R)
-        # This is the induced voltage that opposes applied voltage
-        self.back_emf = max(0.0, self.voltage - (self.current * self.winding_resistance))
-
-        # Back-EMF ratio: Vb/V (0-1 scale)
-        # High ratio = motor running at full speed with light load
-        # Low ratio = motor loaded heavily or stalled
-        if self.voltage > 0.5:
-            back_emf_ratio = self.back_emf / self.voltage
-        else:
-            back_emf_ratio = 0.0
-
-        # Ke (back-EMF constant): Vb = Ke × ω
-        # Vb = Ke × (RPM × 2π / 60)
+        # Back-EMF constant: Ke = Vb / ω
         if self.speed > 100:
-            omega = (self.speed * 2.0 * 3.14159) / 60.0
-            self.back_emf_constant = self.back_emf / omega if omega > 0 else 0.0
+            omega = (self.speed * 2 * 3.14159) / 60  # rad/s
+            self.ke = self.back_emf / omega
         else:
-            self.back_emf_constant = 0.0
+            self.ke = 0.0
 
-        # Km (torque constant): τ = Km × I
-        # For most DC motors: Ke ≈ Km (in SI units)
-        self.motor_constant = self.back_emf_constant if self.back_emf_constant > 0 else 0.01
-
+        # 3. LOAD & SPEED
         # ─────────────────────────────────────────────────
-        # 3. SPEED & ACCELERATION ANALYSIS
+        self.speed_pct = min(100.0, (self.speed / self.rpm_max) * 100.0)
+        self.load_pct = min(100.0, (self.current / self.current_nominal) * 100.0)
+
+        # 4. TORQUE ESTIMATION
         # ─────────────────────────────────────────────────
+        # τ = Km × I
+        self.torque = self.km * self.current
 
-        # Speed rate of change: dRPM/dt (RPM/s)
-        if len(self.speed_history) >= 2:
-            prev_speed = self.speed_history[-2]
-            speed_delta = self.speed - prev_speed
-            self.speed_rate_of_change = speed_delta * self.update_rate
-        else:
-            self.speed_rate_of_change = 0.0
-
-        # Speed percentage: 0-100% of max speed (3000 RPM)
-        self.speed_percentage = min(100.0, (self.speed / self.thresholds["speed_nominal"]) * 100.0)
-
+        # 5. CURRENT RIPPLE (Brush condition indicator)
         # ─────────────────────────────────────────────────
-        # 4. CURRENT RIPPLE & COMMUTATOR CONDITION
-        # ─────────────────────────────────────────────────
-
-        # Current ripple: variance of current over last 10 samples
-        if len(self.current_history) >= 5 and self.current > 0.1:
-            avg_current = sum(self.current_history) / len(self.current_history)
-            variance = sum((i - avg_current) ** 2 for i in self.current_history) / len(self.current_history)
+        if len(self.current_history) >= 5 and self.current > 0.5:
+            avg_i = sum(self.current_history) / len(self.current_history)
+            variance = sum((i - avg_i) ** 2 for i in self.current_history) / len(self.current_history)
             std_dev = variance ** 0.5
-            self.current_ripple = (std_dev / avg_current * 100.0) if avg_current > 0 else 0.0
-            self.current_smoothness = max(0.0, 1.0 - (self.current_ripple / 100.0))
+            self.current_ripple = (std_dev / avg_i * 100.0) if avg_i > 0 else 0.0
         else:
             self.current_ripple = 0.0
-            self.current_smoothness = 1.0
 
+        self.current_avg = sum(self.current_history) / len(self.current_history) if self.current_history else self.current
+
+        # 6. THERMAL ANALYSIS
         # ─────────────────────────────────────────────────
-        # 5. THERMAL ANALYSIS
-        # ─────────────────────────────────────────────────
+        self.temp_rise = self.temperature - self.thresholds["temp_ambient"]
 
-        # Heat generation: primarily from I²R losses + friction
-        self.thermal_power = self.resistive_loss + friction_loss
-
-        # Temperature rise from ambient
-        self.temp_rise_from_ambient = self.temperature - self.thresholds["temp_ambient"]
-
-        # Rate of temperature change: dT/dt (°C/s)
         if len(self.temp_history) >= 2:
-            prev_temp = self.temp_history[-2]
-            temp_delta = self.temperature - prev_temp
-            self.temp_rate_of_change = temp_delta * self.update_rate
+            temp_delta = self.temperature - self.temp_history[-2]
+            self.temp_rise_rate = temp_delta * self.update_rate
         else:
-            self.temp_rate_of_change = 0.0
+            self.temp_rise_rate = 0.0
 
-        # Heat dissipation rate (Newton's Law of Cooling approximation)
-        # Higher motor running = faster heat dissipation (air flow effect)
-        # Q_dissipate ≈ k × ΔT × (1 + v_factor)
-        speed_factor = 1.0 + (self.speed / self.thresholds["speed_nominal"]) * 0.5
-        self.heat_dissipation_rate = 0.05 * self.temp_rise_from_ambient * speed_factor
-
-        # ─────────────────────────────────────────────────
-        # 6. LOAD CLASSIFICATION
-        # ─────────────────────────────────────────────────
-
-        # Load percentage: normalized to max safe current
-        max_safe_current = self.thresholds["current_nominal_load"]
-        self.load_percentage = min(100.0, (self.current / max_safe_current) * 100.0)
-
-        # Load condition classification
-        if self.current < self.thresholds["current_light_load"]:
-            self.load_condition = LoadCondition.LIGHT
-        elif self.current < self.thresholds["current_moderate_load"]:
-            self.load_condition = LoadCondition.MODERATE
-        elif self.current < self.thresholds["current_nominal_load"]:
-            self.load_condition = LoadCondition.NOMINAL
-        else:
-            self.load_condition = LoadCondition.HEAVY
-
-        # Duty cycle: voltage ratio
-        if self.thresholds["voltage_nominal"] > 0:
-            self.duty_cycle = min(100.0, (self.voltage / self.thresholds["voltage_nominal"]) * 100.0)
-        else:
-            self.duty_cycle = 0.0
-
-        # ─────────────────────────────────────────────────
-        # 7. TORQUE ESTIMATION
-        # ─────────────────────────────────────────────────
-
-        # Estimated torque: τ = Km × I
-        # Km is motor constant (N⋅m/A), typically 0.01-0.1 for small brushed DC
-        self.estimated_torque = self.motor_constant * self.current
-
-        # Estimated mechanical power from torque
-        # P_mech = τ × ω
-        if self.speed > 10:
-            omega = (self.speed * 2.0 * 3.14159) / 60.0
-            self.estimated_mechanical_power = self.estimated_torque * omega
-        else:
-            self.estimated_mechanical_power = 0.0
+    def _update_history(self):
+        """Maintain sliding window for trend analysis"""
+        self.current_history.append(self.current)
+        self.speed_history.append(self.speed)
+        self.temp_history.append(self.temperature)
 
     # =====================================================
-    # FSM STATE MACHINE (DETERMINISTIC, ROBUST)
+    # STATE MACHINE
     # =====================================================
-    def _fsm_update(self):
-        """
-        Finite State Machine for 12V brushed DC motor.
-        
-        State Transitions:
-        OFFLINE ← power_off
-          ↓ power_on
-        IDLE ← stop/decelerate to zero
-          ↓ start command
-        ACCELERATING → speed reaches min_running
-          ↓
-        RUNNING ← stable speed
-          ↓ stop command
-        DECELERATING → speed reaches zero
-          ↓
-        IDLE/OFFLINE
-        
-        STALLED ← high current + low speed
-        FAULT ← critical condition
-        """
-        self.previous_state = self.state
+    def _update_state(self):
+        """Simple state transitions"""
         elapsed = time.time() - self.state_entry_time
 
-        # ─────────────────────────────────────────────────
-        # EXTERNAL COMMANDS (Highest priority)
-        # ─────────────────────────────────────────────────
-
+        # Power off → OFF
         if not self.powered_on:
-            if self.state != MotorState.OFFLINE:
-                self.state = MotorState.OFFLINE
-                self.speed = 0
-                self._log("→ OFFLINE (power disabled)", level="info")
+            if self.state != MotorState.OFF:
+                self.state = MotorState.OFF
+                self.running = False
             return
 
-        # ─────────────────────────────────────────────────
-        # STATE MACHINE LOGIC
-        # ─────────────────────────────────────────────────
-
-        # OFFLINE STATE
-        if self.state == MotorState.OFFLINE:
-            # Transition on power_on
-            if self.powered_on:
-                self.state = MotorState.IDLE
-                self.state_entry_time = time.time()
-                self._log("→ IDLE (power enabled)", level="info")
-
-        # IDLE STATE (Power on, motor stationary)
-        elif self.state == MotorState.IDLE:
-            if self.command_start:
-                self.state = MotorState.ACCELERATING
-                self.state_entry_time = time.time()
-                self.acceleration_phase_time = 0.0
-                self.command_start = False
-                self._log("→ ACCELERATING (start command)", level="info")
-
-        # ACCELERATING STATE (Ramping up speed)
-        elif self.state == MotorState.ACCELERATING:
-            self.acceleration_phase_time = elapsed
-
-            if self.speed >= self.thresholds["speed_min_running"]:
-                # Reached minimum running speed
-                self.state = MotorState.RUNNING
-                self.state_entry_time = time.time()
-                self._log(f"→ RUNNING (speed reached {self.speed} RPM)", level="info")
-
-            elif elapsed > self.thresholds["acceleration_timeout"]:
-                # Failed to accelerate within timeout
-                self.state = MotorState.FAULT
-                self.faults.append(FaultType.STALL_CONDITION)
-                self._log(f"❌ ACCELERATION TIMEOUT - stalled at {self.speed} RPM after {elapsed:.1f}s", level="critical")
-
-            elif self.speed_rate_of_change < self.thresholds["acceleration_ramp_min"] and elapsed > 0.5:
-                # Acceleration is too slow (friction/mechanical jam)
-                # Log as warning but don't fault immediately (allow 3-cycle persistence)
-                self._log(f"⚠️  SLOW ACCELERATION: {self.speed_rate_of_change:.1f} RPM/s", level="warning")
-
-        # RUNNING STATE (Nominal operation)
-        elif self.state == MotorState.RUNNING:
-            if self.command_stop:
-                self.state = MotorState.DECELERATING
-                self.state_entry_time = time.time()
-                self.command_stop = False
-                self._log("→ DECELERATING (stop command)", level="info")
-
-            # Transition to STALLED if conditions met
-            if self.current > self.thresholds["current_stall"] and self.speed < self.thresholds["speed_stalled"]:
-                self.state = MotorState.STALLED
-                self.state_entry_time = time.time()
-                self._log(f"⚠️  STALLED: {self.current:.2f}A at {self.speed} RPM", level="warning")
-
-        # DECELERATING STATE (Ramping down speed)
-        elif self.state == MotorState.DECELERATING:
-            if self.speed < self.thresholds["speed_min_running"]:
-                self.state = MotorState.IDLE
-                self.state_entry_time = time.time()
-                self._log("→ IDLE (speed decayed)", level="info")
-
-        # STALLED STATE (High current, low speed)
-        elif self.state == MotorState.STALLED:
-            # If stall condition clears (current drops or speed increases)
-            if (self.current < self.thresholds["current_heavy_load"] and
-                self.speed > self.thresholds["speed_stalled"]):
-                self.state = MotorState.RUNNING
-                self.state_entry_time = time.time()
-                self._log("→ RUNNING (stall condition cleared)", level="info")
-
-            # Or transition to fault if severe
-            elif (self.current > self.thresholds["current_max_safe"] and
-                  self.speed < self.thresholds["speed_stalled"]):
-                self.state = MotorState.FAULT
-                self._log("❌ STALL ESCALATED TO FAULT (overcurrent)", level="critical")
-
-        # OVERHEATING STATE
-        elif self.state == MotorState.OVERHEATING:
-            if self.temperature < self.thresholds["temp_warning"] - self.thresholds["temp_hysteresis"]:
-                self.state = MotorState.RUNNING
-                self.state_entry_time = time.time()
-                self._log("→ RUNNING (temperature normalized)", level="info")
-
-        # FAULT STATE
-        elif self.state == MotorState.FAULT:
-            # Only recover if faults are cleared AND timeout elapsed
-            if not self.critical_fault_detected and elapsed > 3.0:
-                self.state = MotorState.IDLE
-                self.state_entry_time = time.time()
-                self._log("→ IDLE (fault recovery, manual restart needed)", level="info")
-
-        # SHUTDOWN STATE
-        elif self.state == MotorState.SHUTDOWN:
-            # Force offline after 2 seconds
-            if elapsed > 2.0:
-                self.state = MotorState.OFFLINE
-                self._log("→ OFFLINE (emergency shutdown complete)", level="info")
-
-        # Update entry time on state change
-        if self.state != self.previous_state:
+        # OFF → IDLE (when powered on)
+        if self.state == MotorState.OFF and self.powered_on:
+            self.state = MotorState.IDLE
             self.state_entry_time = time.time()
 
+        # IDLE + start command → RUNNING
+        if self.state == MotorState.IDLE and self.command_start:
+            self.running = True
+            self.state = MotorState.RUNNING
+            self.command_start = False
+            self.state_entry_time = time.time()
+            self._log("→ RUNNING", level="info")
+
+        # RUNNING + stop command → IDLE
+        if self.state == MotorState.RUNNING and self.command_stop:
+            self.running = False
+            self.state = MotorState.IDLE
+            self.command_stop = False
+            self.state_entry_time = time.time()
+            self._log("→ IDLE", level="info")
+
+        # FAULT → manual recovery
+        if self.state == MotorState.FAULT:
+            # Can only recover by power cycle
+            if not self.powered_on:
+                self.state = MotorState.OFF
+
     # =====================================================
-    # FAULT ENGINE (COMPREHENSIVE & PERSISTENT)
+    # FAULT DETECTION
     # =====================================================
-    def _fault_engine(self):
-        """
-        Multi-level fault detection with severity classification.
-        
-        Strategy:
-        1. Check all fault conditions in this cycle
-        2. Persist faults across 3+ cycles to filter noise
-        3. Escalate critical faults immediately
-        4. Track history for diagnostics
-        """
-        current_cycle_faults = []
+    def _detect_faults(self):
+        """Practical fault detection for 12V motor"""
+        current_faults = []
 
         # ─────────────────────────────────────────────────
-        # CRITICAL FAULTS (Immediate stop required)
+        # CRITICAL FAULTS
         # ─────────────────────────────────────────────────
 
-        # 1. STALL CONDITION
-        # High current flowing but motor locked or severely jammed
-        if (self.powered_on and
-            self.current > self.thresholds["current_heavy_load"] and
-            self.speed < self.thresholds["speed_stalled"]):
-            current_cycle_faults.append(FaultType.STALL_CONDITION)
-            self.critical_fault_detected = True
-            self._log(f"🔴 CRITICAL: STALL - {self.current:.2f}A @ {self.speed} RPM", level="critical")
+        # 1. STALL: High current + zero speed = rotor locked
+        if self.running and self.current > 5.0 and self.speed < 50:
+            current_faults.append(FaultType.STALL)
+            self._log(f"🔴 STALL: {self.current:.2f}A @ {self.speed} RPM", level="critical")
 
-        # 2. THERMAL RUNAWAY
-        # Temperature exceeds critical threshold (90°C)
+        # 2. THERMAL RUNAWAY: Temp > 90°C
         if self.temperature > self.thresholds["temp_critical"]:
-            current_cycle_faults.append(FaultType.THERMAL_RUNAWAY)
-            self.critical_fault_detected = True
-            self._log(f"🔴 CRITICAL: THERMAL RUNAWAY - {self.temperature:.1f}°C", level="critical")
+            current_faults.append(FaultType.THERMAL_RUNAWAY)
+            self._log(f"🔴 THERMAL RUNAWAY: {self.temperature:.1f}°C", level="critical")
 
-        # 3. WINDING SHORT CIRCUIT
-        # High current at normal/high speed = low impedance (short)
-        # Indicator: current > 6A while speed > 1500 RPM
-        if (self.speed > 1500 and
-            self.current > 6.0 and
-            self.back_emf < self.voltage * 0.5):
-            current_cycle_faults.append(FaultType.WINDING_SHORT)
-            self.critical_fault_detected = True
-            self._log(f"🔴 CRITICAL: WINDING SHORT - {self.current:.2f}A, Back-EMF={self.back_emf:.2f}V", level="critical")
-
-        # 4. EXCESSIVE BRUSH WEAR
-        # High current ripple + low back-EMF constant = worn commutator
-        if (self.current > 2.0 and
-            self.speed < 1000 and
-            self.current_ripple > self.thresholds["current_ripple_threshold"]):
-            current_cycle_faults.append(FaultType.EXCESSIVE_BRUSH_WEAR)
-            self.critical_fault_detected = True
-            self._log(f"🔴 CRITICAL: BRUSH WEAR - Ripple {self.current_ripple:.1f}%, Speed {self.speed} RPM", level="critical")
-
-        # 5. VOLTAGE COLLAPSE
-        # Supply voltage dropped below safe minimum during operation
-        if (self.powered_on and
-            self.voltage < self.thresholds["voltage_critical_min"] and
-            self.speed > self.thresholds["speed_min_running"]):
-            current_cycle_faults.append(FaultType.VOLTAGE_COLLAPSE)
-            self.critical_fault_detected = True
-            self._log(f"🔴 CRITICAL: VOLTAGE COLLAPSE - {self.voltage:.2f}V", level="critical")
+        # 3. WINDING SHORT: High current but low back-EMF
+        # Indicator: Current > 5A but back-EMF < 2V (motor not generating voltage)
+        if (self.running and
+            self.current > 5.0 and
+            self.speed > 1000 and
+            self.back_emf < 2.0):
+            current_faults.append(FaultType.WINDING_SHORT)
+            self._log(f"🔴 WINDING SHORT: I={self.current:.2f}A, Back-EMF={self.back_emf:.2f}V", level="critical")
 
         # ─────────────────────────────────────────────────
-        # SEVERE FAULTS (Escalate within 2-3 cycles)
+        # SEVERE FAULTS
         # ─────────────────────────────────────────────────
 
-        # 6. OVERHEAT WARNING
-        # Temperature in warning range (70-90°C)
+        # 4. OVERHEAT WARNING: 75-90°C
         if (self.thresholds["temp_warning"] <= self.temperature <
             self.thresholds["temp_critical"]):
-            current_cycle_faults.append(FaultType.OVERHEAT_WARNING)
-            self._log(f"⚠️  SEVERE: OVERHEAT WARNING - {self.temperature:.1f}°C", level="warning")
+            current_faults.append(FaultType.OVERHEAT)
+            self._log(f"⚠️  OVERHEAT: {self.temperature:.1f}°C", level="warning")
 
-        # 7. HIGH CURRENT SPIKE
-        # Transient overcurrent above baseline (e.g., sudden load spike)
-        if len(self.current_history) > 1:
-            baseline_current = sum(list(self.current_history)[:-1]) / (len(self.current_history) - 1)
-        else:
-            baseline_current = 0
-        current_spike = self.current - baseline_current
-        if (current_spike > self.thresholds["current_spike_detection"] and
-            self.current > 3.0):
-            current_cycle_faults.append(FaultType.HIGH_CURRENT_SPIKE)
-            self._log(f"⚠️  SEVERE: CURRENT SPIKE - {self.current:.2f}A (Δ{current_spike:.2f}A)", level="warning")
+        # 5. HIGH CURRENT SPIKE: > 6.5A
+        if self.current > self.thresholds["current_spike"]:
+            current_faults.append(FaultType.HIGH_CURRENT)
+            self._log(f"⚠️  HIGH CURRENT: {self.current:.2f}A", level="warning")
 
-        # 8. VOLTAGE INSTABILITY
-        # Supply voltage fluctuating more than 2V
-        if len(self.voltage_history) >= 3:
-            voltage_range = max(self.voltage_history) - min(self.voltage_history)
-            if voltage_range > self.thresholds["voltage_change_threshold"] * 2:
-                current_cycle_faults.append(FaultType.VOLTAGE_INSTABILITY)
-                self._log(f"⚠️  SEVERE: VOLTAGE INSTABILITY - Range {voltage_range:.2f}V", level="warning")
-
-        # 9. BACK-EMF ANOMALY
-        # Back-EMF ratio outside expected range (indicates motor damage)
-        if self.voltage > 0.5:
-            back_emf_ratio = self.back_emf / self.voltage
-            if (self.speed > 1000 and
-                (back_emf_ratio < self.thresholds["back_emf_ratio_min"] or
-                 back_emf_ratio > self.thresholds["back_emf_ratio_max"])):
-                current_cycle_faults.append(FaultType.BACK_EMF_ANOMALY)
-                self._log(f"⚠️  SEVERE: BACK-EMF ANOMALY - Ratio {back_emf_ratio:.3f}", level="warning")
+        # 6. LOW VOLTAGE: < 10V (motor struggling)
+        if self.voltage < self.thresholds["voltage_low"] and self.running:
+            current_faults.append(FaultType.VOLTAGE_DROP)
+            self._log(f"⚠️  VOLTAGE DROP: {self.voltage:.2f}V", level="warning")
 
         # ─────────────────────────────────────────────────
-        # WARNING FAULTS (Monitor and log)
+        # WARNING FAULTS
         # ─────────────────────────────────────────────────
 
-        # 10. REDUCED EFFICIENCY
-        # Efficiency drops below 40% (friction, load mismatch, aging)
-        if (self.powered_on and
-            self.speed > self.thresholds["speed_min_running"] and
-            self.efficiency < self.thresholds["efficiency_min"]):
-            current_cycle_faults.append(FaultType.REDUCED_EFFICIENCY)
-            self._log(f"⚠️  WARNING: REDUCED EFFICIENCY - {self.efficiency:.1f}%", level="warning")
+        # 7. LOW EFFICIENCY: < 50% (bearing friction or internal damage)
+        if (self.running and
+            self.speed > 500 and
+            self.current > 1.0 and
+            self.efficiency < self.thresholds["efficiency_low"]):
+            current_faults.append(FaultType.LOW_EFFICIENCY)
+            self._log(f"⚠️  LOW EFFICIENCY: {self.efficiency:.1f}%", level="warning")
 
-        # 11. ABNORMAL ACCELERATION
-        # Slow ramp-up rate during starting phase
-        if (self.state == MotorState.ACCELERATING and
-            self.acceleration_phase_time > 1.0 and
-            self.speed_rate_of_change < self.thresholds["acceleration_ramp_min"]):
-            current_cycle_faults.append(FaultType.ABNORMAL_ACCELERATION)
-            self._log(f"⚠️  WARNING: SLOW ACCELERATION - {self.speed_rate_of_change:.1f} RPM/s", level="warning")
-
-        # 12. CURRENT RIPPLE (Commutator wear indicator)
-        # High ripple suggests worn brushes or commutator segments
-        if (self.current > 1.0 and
-            self.current_ripple > self.thresholds["current_ripple_threshold"]):
-            current_cycle_faults.append(FaultType.CURRENT_RIPPLE_HIGH)
-            self._log(f"⚠️  WARNING: HIGH CURRENT RIPPLE - {self.current_ripple:.1f}%", level="warning")
-
-        # 13. THERMAL DRIFT
-        # Temperature increasing too rapidly (trend warning)
-        if (self.temp_rate_of_change >
-            self.thresholds["temp_rise_rate_max"] and
-            self.temperature > 50.0):
-            current_cycle_faults.append(FaultType.THERMAL_DRIFT)
-            self._log(f"⚠️  WARNING: THERMAL DRIFT - {self.temp_rate_of_change:.2f}°C/s", level="warning")
+        # 8. BRUSH WEAR: High current ripple (> 30%)
+        if (self.running and
+            self.current > 1.0 and
+            self.current_ripple > self.thresholds["ripple_worn"]):
+            current_faults.append(FaultType.BRUSH_WEAR)
+            self._log(f"⚠️  BRUSH WEAR: Ripple {self.current_ripple:.1f}%", level="warning")
 
         # ─────────────────────────────────────────────────
         # FAULT PERSISTENCE LOGIC
         # ─────────────────────────────────────────────────
 
-        # Update fault history: increment on detection, decrement otherwise
+        # Update fault counts
         for fault in FaultType:
-            if fault in current_cycle_faults:
-                self.fault_history[fault] += 1
+            if fault in current_faults:
+                self.fault_counts[fault] += 1
             else:
-                self.fault_history[fault] = max(0, self.fault_history[fault] - 1)
+                self.fault_counts[fault] = max(0, self.fault_counts[fault] - 1)
 
-        # Finalize fault list: only include persistent faults
-        self.faults.clear()
-        for fault, count in self.fault_history.items():
-            if count >= self.fault_persistence:
-                self.faults.append(fault)
+        # Finalize fault list (persistent faults only)
+        self.faults = [
+            fault for fault, count in self.fault_counts.items()
+            if count >= self.fault_persistence_threshold
+        ]
 
-        # ─────────────────────────────────────────────────
-        # ESCALATION RULES
-        # ─────────────────────────────────────────────────
-
-        if self.faults:
-            fault_names = ', '.join([f.value for f in self.faults])
-            self._log(f"🔴 ACTIVE FAULTS: {fault_names}", level="critical" if self.critical_fault_detected else "warning")
-
-        # Check for critical faults
-        critical_faults = [f for f in self.faults if FAULT_SEVERITY_MAP[f] == FaultSeverity.CRITICAL]
-        if critical_faults:
-            self.critical_fault_detected = True
-        else:
-            self.critical_fault_detected = False
+        # Escalate critical faults immediately
+        critical_faults = [FaultType.STALL, FaultType.THERMAL_RUNAWAY, FaultType.WINDING_SHORT]
+        if any(f in self.faults for f in critical_faults):
+            if self.state != MotorState.FAULT:
+                self.state = MotorState.FAULT
+                self.running = False
+                self._log(f"🔴 FAULT STATE: {[f.value for f in self.faults]}", level="critical")
 
     # =====================================================
-    # LOGGING (EVENT-DRIVEN)
+    # LOGGING
     # =====================================================
     def _log(self, msg: str, level: str = "info"):
-        """Append timestamped log entry with severity level"""
-        self.log.append({
-            "timestamp": time.time(),
-            "state": self.state.value,
+        """Log entry"""
+        self.logs.append({
+            "time": time.time(),
             "level": level,
+            "state": self.state.value,
             "message": msg,
             "snapshot": {
                 "V": round(self.voltage, 2),
@@ -861,219 +493,78 @@ class DCMotor:
     # STATUS REPORT
     # =====================================================
     def status(self) -> Dict:
-        """Generate comprehensive motor status snapshot"""
+        """Complete motor status snapshot"""
         return {
-            # IDENTITY & TIMING
             "name": self.name,
             "timestamp": time.time(),
             "state": self.state.value,
+            "powered_on": self.powered_on,
+            "running": self.running,
             
-            # SENSORS (Raw)
-            "voltage": round(self.voltage, 2),
-            "current": round(self.current, 2),
-            "speed": self.speed,
-            "temperature": round(self.temperature, 1),
+            # Sensors (raw)
+            "voltage_v": round(self.voltage, 2),
+            "current_a": round(self.current, 2),
+            "speed_rpm": self.speed,
+            "temperature_c": round(self.temperature, 1),
             
-            # POWER & ENERGY
+            # Derived quantities
             "power_input_w": round(self.power_input, 2),
             "power_mechanical_w": round(self.power_mechanical, 2),
-            "power_loss_w": round(self.resistive_loss + 0.3 * self.power_input, 2),
-            "efficiency_percent": round(self.efficiency, 1),
+            "power_loss_w": round(self.power_loss, 2),
+            "efficiency_pct": round(self.efficiency, 1),
             
-            # BACK-EMF & MOTOR CONSTANTS
+            # Back-EMF & Motor
             "back_emf_v": round(self.back_emf, 2),
-            "back_emf_constant_ke": round(self.back_emf_constant, 4),
-            "motor_constant_km": round(self.motor_constant, 4),
+            "back_emf_constant_ke": round(self.ke, 4),
+            "estimated_torque_nm": round(self.torque, 3),
             
-            # SPEED & ACCELERATION
-            "speed_percent_of_max": round(self.speed_percentage, 1),
-            "acceleration_rpm_per_sec": round(self.speed_rate_of_change, 2),
+            # Load & Speed
+            "speed_pct_of_max": round(self.speed_pct, 1),
+            "load_pct": round(self.load_pct, 1),
             
-            # CURRENT ANALYSIS
-            "current_ripple_percent": round(self.current_ripple, 1),
-            "current_smoothness_0_to_1": round(self.current_smoothness, 2),
-            "load_condition": self.load_condition.value,
-            "load_percent": round(self.load_percentage, 1),
+            # Current Analysis
+            "current_ripple_pct": round(self.current_ripple, 1),
+            "current_avg_a": round(self.current_avg, 2),
             
-            # THERMAL
-            "temp_rise_from_ambient_c": round(self.temp_rise_from_ambient, 1),
-            "thermal_power_w": round(self.thermal_power, 2),
-            "temp_rate_of_change_c_per_sec": round(self.temp_rate_of_change, 3),
-            "heat_dissipation_w": round(self.heat_dissipation_rate, 2),
+            # Thermal
+            "temp_rise_from_ambient_c": round(self.temp_rise, 1),
+            "temp_rise_rate_c_per_sec": round(self.temp_rise_rate, 3),
             
-            # TORQUE & MECHANICAL
-            "estimated_torque_nm": round(self.estimated_torque, 3),
-            "estimated_mechanical_power_w": round(self.estimated_mechanical_power, 2),
-            
-            # HEALTH
+            # Health
             "faults": [f.value for f in self.faults],
-            "fault_history": {k.value: v for k, v in self.fault_history.items() if v > 0},
-            "critical_fault": self.critical_fault_detected,
-            
-            # STATE TRACKING
-            "state_duration_seconds": round(time.time() - self.state_entry_time, 2),
-            "powered_on": self.powered_on,
+            "health_score": self.get_health_score(),
         }
 
-    # =====================================================
-    # DIAGNOSTICS
-    # =====================================================
-    def get_logs(self, limit: int = 50) -> List[Dict]:
-        """Return most recent log entries"""
-        return list(self.log)[-limit:]
-
-    def clear_logs(self):
-        """Clear log history"""
-        self.log.clear()
-        self._log("LOGS CLEARED", level="info")
-
-    def reset_faults(self):
-        """Clear fault history (manual intervention)"""
-        self.faults.clear()
-        self.fault_history = {ft: 0 for ft in FaultType}
-        self.critical_fault_detected = False
-        self._log("FAULT HISTORY RESET", level="info")
-
     def get_health_score(self) -> float:
-        """
-        Calculate overall motor health (0-100%).
-        
-        Factors:
-        - Temperature (20% weight)
-        - Efficiency (20% weight)
-        - Current ripple (15% weight)
-        - Thermal drift (15% weight)
-        - Active faults (30% weight)
-        """
+        """Health score 0-100%"""
         score = 100.0
 
         # Temperature penalty
         if self.temperature > self.thresholds["temp_critical"]:
-            temp_penalty = 100.0
+            score -= 100.0
         elif self.temperature > self.thresholds["temp_warning"]:
-            temp_penalty = 20.0 + (self.temperature - self.thresholds["temp_warning"]) / 15.0 * 30.0
-        else:
-            temp_penalty = 0.0
-        score -= temp_penalty * 0.20
+            penalty = (self.temperature - self.thresholds["temp_warning"]) / 15.0 * 30.0
+            score -= penalty
 
         # Efficiency penalty
-        if self.efficiency < self.thresholds["efficiency_min"]:
-            eff_penalty = 20.0
+        if self.efficiency < self.thresholds["efficiency_low"]:
+            score -= 20.0
         elif self.efficiency < 60.0:
-            eff_penalty = (60.0 - self.efficiency) / 20.0 * 15.0
-        else:
-            eff_penalty = 0.0
-        score -= eff_penalty * 0.20
+            penalty = (60.0 - self.efficiency) / 10.0 * 15.0
+            score -= penalty
 
-        # Current ripple penalty (commutator wear indicator)
-        ripple_penalty = min(15.0, self.current_ripple / self.thresholds["current_ripple_threshold"] * 15.0)
-        score -= ripple_penalty * 0.15
-
-        # Thermal drift penalty
-        drift_penalty = min(15.0, max(0.0, self.temp_rate_of_change / self.thresholds["temp_rise_rate_max"] * 15.0))
-        score -= drift_penalty * 0.15
+        # Ripple penalty
+        if self.current_ripple > self.thresholds["ripple_worn"]:
+            penalty = min(15.0, (self.current_ripple - self.thresholds["ripple_worn"]) / 20.0 * 15.0)
+            score -= penalty
 
         # Fault penalty
-        fault_penalty = min(30.0, len(self.faults) * 10.0)
-        score -= fault_penalty * 0.30
+        score -= len(self.faults) * 10.0
 
         return max(0.0, min(100.0, score))
 
+    def get_logs(self, limit: int = 50) -> List[Dict]:
+        """Get recent logs"""
+        return list(self.logs)[-limit:]
 
-# =========================
-# TEST SCENARIOS
-# =========================
-if __name__ == "__main__":
-    print("=" * 80)
-    print("12V BRUSHED DC MOTOR CONTROL SYSTEM - COMPREHENSIVE TEST SUITE")
-    print("=" * 80)
 
-    motor = DCMotor("Test-Motor", update_rate=10.0)
-
-    # TEST 1: Power-on and idle
-    print("\n[TEST 1] Power ON → IDLE State")
-    print("-" * 80)
-    motor.power_on()
-    for i in range(5):
-        motor.update(12.0, 0.5, 0, 25.0)
-        status = motor.status()
-        print(f"  Cycle {i}: {status['state']:15s} | V={status['voltage']:.1f}V | I={status['current']:.2f}A | T={status['temperature']:.1f}°C")
-
-    # TEST 2: Startup and acceleration
-    print("\n[TEST 2] START Command → ACCELERATING → RUNNING")
-    print("-" * 80)
-    motor.start_motor()
-    for i in range(60):
-        ramp = i / 60.0
-        rpm = int(3000 * ramp)
-        current = 0.5 + (4.0 * ramp)
-        motor.update(12.0, current, rpm, 25.0 + 30.0 * ramp)
-        if i % 15 == 0:
-            status = motor.status()
-            print(f"  Cycle {i:2d}: {status['state']:15s} | RPM={status['speed']:4d} | I={status['current']:.2f}A | Eff={status['efficiency_percent']:.1f}% | T={status['temperature']:.1f}°C")
-
-    # TEST 3: Stall detection
-    print("\n[TEST 3] Sudden STALL Condition (High Current, Zero RPM)")
-    print("-" * 80)
-    for i in range(30):
-        if i < 20:
-            # Normal running
-            motor.update(12.0, 2.0, 2000, 60.0)
-        else:
-            # Sudden jam (load applied)
-            motor.update(12.0, 6.0, 10, 75.0)
-        
-        if i >= 15:
-            status = motor.status()
-            print(f"  Cycle {i:2d}: {status['state']:15s} | RPM={status['speed']:4d} | I={status['current']:.2f}A | Faults={status['faults']}")
-
-    # TEST 4: Thermal runaway
-    print("\n[TEST 4] OVERHEAT WARNING → THERMAL RUNAWAY")
-    print("-" * 80)
-    motor.reset_faults()
-    motor.power_on()
-    motor.start_motor()
-    for i in range(50):
-        temp = 25.0 + (70.0 * (i / 50.0))
-        motor.update(12.0, 3.5, 2500, temp)
-        if i % 10 == 0:
-            status = motor.status()
-            print(f"  Cycle {i:2d}: {status['state']:15s} | T={status['temperature']:.1f}°C | Critical={status['critical_fault']} | Faults={status['faults']}")
-
-    # TEST 5: Voltage instability
-    print("\n[TEST 5] VOLTAGE INSTABILITY Detection")
-    print("-" * 80)
-    motor.reset_faults()
-    motor.power_on()
-    motor.start_motor()
-    voltages = [12.0, 11.8, 13.2, 11.5, 12.0, 12.3, 11.0, 12.8, 12.0]  # Fluctuating
-    for i, v in enumerate(voltages * 3):
-        motor.update(v, 2.5, 2000, 55.0)
-        status = motor.status()
-        print(f"  Cycle {i:2d}: V={status['voltage']:.2f}V | Faults={status['faults']}")
-
-    # TEST 6: Health score tracking
-    print("\n[TEST 6] HEALTH SCORE Degradation")
-    print("-" * 80)
-    motor.reset_faults()
-    motor.power_on()
-    motor.start_motor()
-    for i in range(40):
-        # Simulate aging: increasing current ripple, temp drift
-        temp = 25.0 + (50.0 * (i / 40.0))
-        current = 2.0 + (2.0 * (i / 40.0))
-        motor.update(12.0, current, 2000 - (500 * i / 40.0), temp)
-        if i % 10 == 0:
-            status = motor.status()
-            health = motor.get_health_score()
-            print(f"  Cycle {i:2d}: Health={health:5.1f}% | T={status['temperature']:.1f}°C | Eff={status['efficiency_percent']:.1f}% | Ripple={status['current_ripple_percent']:.1f}%")
-
-    # Final Summary
-    print("\n" + "=" * 80)
-    print("TEST SUITE COMPLETE")
-    print("=" * 80)
-    final_status = motor.status()
-    print(f"Final State: {final_status['state']}")
-    print(f"Health Score: {motor.get_health_score():.1f}%")
-    print(f"Active Faults: {final_status['faults']}")
-    print(f"Total Log Entries: {len(motor.log)}")
