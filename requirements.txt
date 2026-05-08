@@ -1,8 +1,10 @@
-# Core dependencies
+# Core dependencies — pinned for Python 3.11 compatibility
+# pydantic-core 2.14.1 (bundled with pydantic 2.5.x) is NOT compatible with Python 3.13.
+# These versions work with Python 3.11 (used in Dockerfile).
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.6.3
-python-dotenv==1.0.0
+python-dotenv==1.0.1
 
 # Database — optional. Only needed if DATABASE_URL is set in .env
 sqlalchemy==2.0.25

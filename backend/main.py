@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     host    = os.getenv("SERVER_HOST", "0.0.0.0")
-    port    = int(os.getenv("SERVER_PORT", "8000"))
+    # Railway injects $PORT; fall back to SERVER_PORT then 8000
+    port    = int(os.getenv("PORT") or os.getenv("SERVER_PORT", "8000"))
     workers = int(os.getenv("WORKERS", "1"))
     debug   = os.getenv("DEBUG", "false").lower() == "true"
 

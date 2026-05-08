@@ -1,0 +1,9 @@
+# Force Python 3.11 if Railway uses Nixpacks instead of Dockerfile
+[phases.setup]
+nixPkgs = ["python311", "postgresql"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python -m backend.main"
