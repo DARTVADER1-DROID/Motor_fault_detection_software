@@ -170,7 +170,7 @@ class MotorThresholds:
     persist_critical: int = 1    # CRITICAL — immediate, never debounce
 
     # Startup
-    startup_grace_ms: int = 600  # Transient window [ms]
+    startup_grace_ms: int = 5000  # Transient window [ms]
 
     # Schema version — increment when fields are added/renamed/removed
     schema_version: int = 3

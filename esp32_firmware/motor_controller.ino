@@ -420,7 +420,6 @@ void checkWiFiConnection() {
   if (millis() - lastWifiAttempt < WIFI_RECONNECT_DELAY) return;
 
   Serial.println("[WIFI] ✗ Disconnected");
-  Serial.printf ("[WIFI]   Reason code : %d\n", (int)WiFi.disconnectReasonCode());
   Serial.println("[WIFI]   Attempting reconnect...");
   connectWiFi();
 }
