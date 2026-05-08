@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>МКС-3.0 // MOTOR FLEET COMMAND</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=Exo+2:ital,wght@0,300;0,400;0,600;1,300&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<div id="scanlines"></div>
+<div id="noise"></div>
+
+<!-- ═══════ MASTHEAD ═══════ -->
+<header id="masthead">
+  <div id="mast-left">
+    <div id="logo-hex">⬡</div>
+    <div id="logo-text">
+      <div id="logo-mks">МКС-3.0</div>
+      <div id="logo-sub">MOTOR FLEET COMMAND SYSTEM</div>
+    </div>
+    <div id="health-orbs">
+      <div class="horb" id="horb-api"><span></span>API</div>
+      <div class="horb" id="horb-cache"><span></span>CACHE</div>
+      <div class="horb" id="horb-db"><span></span>DB</div>
+    </div>
+  </div>
+
+  <div id="mast-ticker-wrap">
+    <div id="mast-ticker">
+      ★ MCS v3.0 ONLINE ★ &nbsp;·&nbsp; 8-FAULT DETECTION ENGINE &nbsp;·&nbsp;
+      FLEET EMERGENCY STOP ARMED &nbsp;·&nbsp; REAL-TIME TELEMETRY &nbsp;·&nbsp;
+      ESP32 COMMAND QUEUE ACTIVE &nbsp;·&nbsp; THERMAL RUNAWAY PROTECTION &nbsp;·&nbsp;
+      WINDING SHORT DETECTION &nbsp;·&nbsp; BRUSH WEAR MONITORING &nbsp;·&nbsp;
+      STARTUP GRACE WINDOW &nbsp;·&nbsp; HARD-RESET FAULT DEBOUNCE &nbsp;·&nbsp;
+    </div>
+  </div>
+
+  <div id="mast-right">
+    <div id="clock-block">
+      <div id="clock-label">SYSTEM TIME</div>
+      <div id="clock-time">--:--:--</div>
+      <div id="clock-date">---</div>
+    </div>
+    <div id="fleet-summary-hdr">
+      <div class="fsh-item"><span id="fsh-total">0</span><label>TOTAL</label></div>
+      <div class="fsh-item running"><span id="fsh-running">0</span><label>RUN</label></div>
+      <div class="fsh-item fault"><span id="fsh-fault">0</span><label>FAULT</label></div>
+      <div class="fsh-item"><span id="fsh-idle">0</span><label>IDLE</label></div>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════ CONFIG BAR ═══════ -->
+<div id="config-bar">
+  <div class="cbar-group">
+    <label>API ENDPOINT</label>
+    <input id="base-url" type="text" value="http://localhost:8000" spellcheck="false">
+  </div>
+  <div class="cbar-group">
+    <label>POLL INTERVAL</label>
+    <select id="poll-interval">
+      <option value="1000">1s</option>
+      <option value="2000" selected>2s</option>
+      <option value="5000">5s</option>
+      <option value="0">MANUAL</option>
+    </select>
+  </div>
+  <div class="cbar-sep"></div>
+  <div class="cbar-group">
+    <label>ACTIVE FAULTS</label>
+    <span class="cbar-val fault-text" id="cbar-faults">0</span>
+  </div>
+  <div class="cbar-group">
+    <label>CONNECTED</label>
+    <span class="cbar-val" id="cbar-connected">0</span>
+  </div>
+  <div class="cbar-sep"></div>
+  <button class="cbar-btn" id="btn-refresh">⟳ REFRESH ALL</button>
+  <button class="cbar-btn" id="btn-health">♥ HEALTH CHECK</button>
+</div>
+
+<!-- ═══════ APP SHELL ═══════ -->
+<div id="app">
+
+  <!-- ──── LEFT SIDEBAR ──── -->
+  <aside id="sidebar">
+
+    <!-- FLEET OPERATIONS -->
+    <section class="spanel" id="fleet-panel">
+      <div class="spanel-hdr"><span class="spanel-icon">◈</span> FLEET OPERATIONS</div>
+      <div class="spanel-body">
+        <div class="fleet-grid">
+          <button class="fbtn fbtn-pwron"  data-fleet="power_on"><span>⏻</span><b>POWER ON</b><small>ALL MOTORS</small></button>
+          <button class="fbtn fbtn-start"  data-fleet="start">   <span>▶</span><b>START</b>   <small>ALL IDLE</small>  </button>
+          <button class="fbtn fbtn-stop"   data-fleet="stop">    <span>◼</span><b>STOP</b>    <small>ALL RUNNING</small></button>
+          <button class="fbtn fbtn-pwroff" data-fleet="power_off"><span>⏼</span><b>POWER OFF</b><small>ALL MOTORS</small></button>
+        </div>
+        <button id="btn-fleet-emg" data-fleet="emergency">
+          <span class="emg-pulse">⚠</span>&nbsp; FLEET EMERGENCY STOP &nbsp;<span class="emg-pulse">⚠</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- REGISTER MOTOR -->
+    <section class="spanel" id="reg-panel">
+      <div class="spanel-hdr"><span class="spanel-icon">✦</span> REGISTER MOTOR</div>
+      <div class="spanel-body">
+        <div class="reg-row">
+          <input id="new-motor-id" type="text" placeholder="MOTOR-ID (e.g. M-01)" maxlength="50" spellcheck="false">
+          <button id="btn-register">ADD</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- MOTOR ROSTER -->
+    <section class="spanel flex-fill" id="roster-panel">
+      <div class="spanel-hdr">
+        <span class="spanel-icon">▣</span> MOTOR ROSTER
+        <span class="roster-count" id="roster-count">0</span>
+      </div>
+      <div id="motor-roster">
+        <div class="empty-roster">NO MOTORS REGISTERED<br><small>ADD A MOTOR ABOVE</small></div>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- ──── MAIN CONTENT ──── -->
+  <main id="main">
+
+    <!-- TAB BAR -->
+    <nav id="tabbar">
+      <button class="tab active" data-tab="telemetry">⬡ TELEMETRY</button>
+      <button class="tab" data-tab="control">⚙ CONTROL</button>
+      <button class="tab" data-tab="faults">⚡ FAULT DIAGNOSIS</button>
+      <button class="tab" data-tab="config">◎ CONFIGURATION</button>
+      <button class="tab" data-tab="history">⏺ HISTORY</button>
+      <button class="tab" data-tab="catalogue">📖 FAULT CATALOGUE</button>
+      <button class="tab" data-tab="esp32">📡 ESP32</button>
+    </nav>
+
+    <!-- ═══ TAB: TELEMETRY ═══ -->
+    <div id="tab-telemetry" class="tabpane active">
+      <div class="tab-toolbar">
+        <span class="ttl">REAL-TIME MOTOR TELEMETRY</span>
+        <div class="tbar-right">
+          <label>SELECT MOTOR:</label>
+          <select id="tel-motor-select"><option value="">— SELECT —</option></select>
+        </div>
+      </div>
+
+      <div id="tel-no-motor" class="no-sel-msg">SELECT A MOTOR FROM THE ROSTER OR DROPDOWN ABOVE</div>
+
+      <div id="tel-content" class="hidden">
+
+        <!-- STATE BANNER -->
+        <div id="tel-state-banner">
+          <div id="tel-state-name">—</div>
+          <div id="tel-state-meta">
+            <span id="tel-motor-name">—</span>
+            <span class="sep">|</span>
+            <span id="tel-powered">UNPOWERED</span>
+            <span class="sep">|</span>
+            <span id="tel-grace">—</span>
+          </div>
+          <div id="tel-health-bar-wrap">
+            <label>HEALTH SCORE</label>
+            <div id="tel-health-bar"><div id="tel-health-fill"></div></div>
+            <span id="tel-health-val">—</span>
+          </div>
+        </div>
+
+        <!-- ACTIVE FAULT STRIP -->
+        <div id="tel-fault-strip"></div>
+
+        <!-- GAUGE GRID -->
+        <div id="gauge-grid">
+          <div class="gauge-card" id="gc-voltage">
+            <div class="gc-label">VOLTAGE</div>
+            <div class="gc-val" id="gv-voltage">—</div>
+            <div class="gc-unit">V</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-voltage"></div></div>
+            <div class="gc-sub">SUPPLY</div>
+          </div>
+          <div class="gauge-card" id="gc-current">
+            <div class="gc-label">CURRENT</div>
+            <div class="gc-val" id="gv-current">—</div>
+            <div class="gc-unit">A</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-current"></div></div>
+            <div class="gc-sub">DRAW</div>
+          </div>
+          <div class="gauge-card" id="gc-speed">
+            <div class="gc-label">SPEED</div>
+            <div class="gc-val" id="gv-speed">—</div>
+            <div class="gc-unit">RPM</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-speed"></div></div>
+            <div class="gc-sub">SHAFT</div>
+          </div>
+          <div class="gauge-card" id="gc-temp">
+            <div class="gc-label">SHELL TEMP</div>
+            <div class="gc-val" id="gv-temp">—</div>
+            <div class="gc-unit">°C</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-temp"></div></div>
+            <div class="gc-sub">CASING (MEASURED)</div>
+          </div>
+          <div class="gauge-card" id="gc-efficiency">
+            <div class="gc-label">EFFICIENCY</div>
+            <div class="gc-val" id="gv-eff">—</div>
+            <div class="gc-unit">%</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-eff"></div></div>
+            <div class="gc-sub">MECHANICAL</div>
+          </div>
+          <div class="gauge-card" id="gc-health">
+            <div class="gc-label">HEALTH</div>
+            <div class="gc-val" id="gv-health">—</div>
+            <div class="gc-unit">/100</div>
+            <div class="gc-bar-wrap"><div class="gc-bar" id="gb-health"></div></div>
+            <div class="gc-sub">COMPOSITE SCORE</div>
+          </div>
+        </div>
+
+        <!-- DETAIL PANELS -->
+        <div id="tel-detail-grid">
+
+          <div class="detail-card">
+            <div class="dc-hdr">⚡ ELECTRICAL</div>
+            <table class="dc-table">
+              <tr><td>Back EMF (measured)</td><td id="td-bemf">—</td><td>V</td></tr>
+              <tr><td>Back EMF (speed-pred)</td><td id="td-bemf-pred">—</td><td>V</td></tr>
+              <tr><td>Ke Live (adaptive)</td><td id="td-ke">—</td><td>V·s/rad</td></tr>
+              <tr><td>Ke Deviation from Km</td><td id="td-ke-dev">—</td><td>%</td></tr>
+              <tr><td>Km Nameplate</td><td id="td-km">—</td><td>N·m/A</td></tr>
+              <tr><td>R_eff (temp-corrected)</td><td id="td-reff">—</td><td>Ω</td></tr>
+              <tr><td>Current Avg (15 cycle)</td><td id="td-iavg">—</td><td>A</td></tr>
+              <tr><td>Current Ripple</td><td id="td-ripple">—</td><td>%</td></tr>
+            </table>
+          </div>
+
+          <div class="detail-card">
+            <div class="dc-hdr">🌡 THERMAL</div>
+            <table class="dc-table">
+              <tr><td>Shell Temp (MEASURED)</td><td id="td-shell">—</td><td>°C</td></tr>
+              <tr><td>Winding Temp (ESTIMATED)</td><td id="td-winding">—</td><td>°C</td></tr>
+              <tr><td>Temp Rise Rate</td><td id="td-rise">—</td><td>°C/s</td></tr>
+            </table>
+            <div class="dc-note">⚠ Sensor is on the shell. Winding is always hotter. All thermal thresholds are shell temperature.</div>
+          </div>
+
+          <div class="detail-card">
+            <div class="dc-hdr">⚙ MECHANICAL</div>
+            <table class="dc-table">
+              <tr><td>Angular Velocity</td><td id="td-omega">—</td><td>rad/s</td></tr>
+              <tr><td>Torque (electromagnetic)</td><td id="td-torque">—</td><td>N·m</td></tr>
+              <tr><td>Load Torque</td><td id="td-torque-load">—</td><td>N·m</td></tr>
+              <tr><td>Speed % of Max (3000)</td><td id="td-speed-pct">—</td><td>%</td></tr>
+              <tr><td>Load % of Nominal (4A)</td><td id="td-load-pct">—</td><td>%</td></tr>
+            </table>
+          </div>
+
+          <div class="detail-card">
+            <div class="dc-hdr">🔋 POWER ANALYSIS</div>
+            <table class="dc-table">
+              <tr><td>Power Input (V×I)</td><td id="td-pin">—</td><td>W</td></tr>
+              <tr><td>Power Mechanical</td><td id="td-pmech">—</td><td>W</td></tr>
+              <tr><td>Power Copper Loss (I²R)</td><td id="td-pcopper">—</td><td>W</td></tr>
+              <tr><td>Power Friction Loss</td><td id="td-pfriction">—</td><td>W</td></tr>
+              <tr><td>Total Loss</td><td id="td-ploss">—</td><td>W</td></tr>
+              <tr><td>Efficiency</td><td id="td-eff2">—</td><td>%</td></tr>
+            </table>
+          </div>
+
+          <div class="detail-card">
+            <div class="dc-hdr">📊 FAULT DEBOUNCE COUNTERS</div>
+            <div class="dc-note">Each counter increments when condition is true; hard-resets to 0 when false.</div>
+            <div id="tel-fault-counts" class="fault-count-grid"></div>
+          </div>
+
+          <div class="detail-card">
+            <div class="dc-hdr">🔌 STATE & CONNECTION</div>
+            <table class="dc-table">
+              <tr><td>State</td><td id="td-state">—</td><td></td></tr>
+              <tr><td>Powered On</td><td id="td-powered">—</td><td></td></tr>
+              <tr><td>Running</td><td id="td-running">—</td><td></td></tr>
+              <tr><td>Startup Grace Active</td><td id="td-grace">—</td><td></td></tr>
+              <tr><td>Connection Status</td><td id="td-connstatus">—</td><td></td></tr>
+              <tr><td>Last Update</td><td id="td-lastupdate">—</td><td></td></tr>
+            </table>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: CONTROL ═══ -->
+    <div id="tab-control" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">SINGLE MOTOR CONTROL</span>
+        <div class="tbar-right">
+          <label>SELECT MOTOR:</label>
+          <select id="ctrl-motor-select"><option value="">— SELECT —</option></select>
+        </div>
+      </div>
+
+      <div id="ctrl-no-motor" class="no-sel-msg">SELECT A MOTOR TO CONTROL</div>
+
+      <div id="ctrl-content" class="hidden">
+
+        <div id="ctrl-state-strip">
+          <div id="ctrl-state-badge">—</div>
+          <div id="ctrl-motor-label">—</div>
+          <div id="ctrl-fault-list"></div>
+        </div>
+
+        <div id="motor-ctrl-btns">
+          <button class="ctrl-btn cb-pwron"  id="cbtn-power-on"><span>⏻</span> POWER ON</button>
+          <button class="ctrl-btn cb-start"  id="cbtn-start">   <span>▶</span> START</button>
+          <button class="ctrl-btn cb-stop"   id="cbtn-stop">    <span>◼</span> STOP</button>
+          <button class="ctrl-btn cb-pwroff" id="cbtn-power-off"><span>⏼</span> POWER OFF</button>
+          <button class="ctrl-btn cb-emg"    id="cbtn-emergency"><span>⚠</span> EMERGENCY STOP</button>
+          <button class="ctrl-btn cb-delete" id="cbtn-delete">  <span>✕</span> UNREGISTER</button>
+        </div>
+
+        <div class="ctrl-section-hdr">📡 INJECT SENSOR DATA — POST /update</div>
+        <div id="sensor-inject-form">
+          <div class="si-row">
+            <div class="si-field">
+              <label>VOLTAGE (V) <small>0–20</small></label>
+              <input type="number" id="si-voltage" value="12.0" min="0" max="20" step="0.1">
+            </div>
+            <div class="si-field">
+              <label>CURRENT (A) <small>0–15</small></label>
+              <input type="number" id="si-current" value="2.0" min="0" max="15" step="0.1">
+            </div>
+            <div class="si-field">
+              <label>SPEED (RPM) <small>0–3500</small></label>
+              <input type="number" id="si-speed" value="1500" min="0" max="3500" step="10">
+            </div>
+            <div class="si-field">
+              <label>SHELL TEMP (°C) <small>−10–120</small></label>
+              <input type="number" id="si-temp" value="35.0" min="-10" max="120" step="0.5">
+            </div>
+          </div>
+          <div class="si-presets">
+            <label>SCENARIO PRESETS:</label>
+            <button class="preset-btn" data-v="12.0" data-i="0.3"  data-n="0"    data-t="28">IDLE</button>
+            <button class="preset-btn" data-v="12.0" data-i="2.5"  data-n="2200" data-t="38">NORMAL RUN</button>
+            <button class="preset-btn" data-v="12.0" data-i="3.8"  data-n="2800" data-t="45">HIGH LOAD</button>
+            <button class="preset-btn" data-v="11.0" data-i="5.8"  data-n="0"    data-t="52">⚡ STALL</button>
+            <button class="preset-btn" data-v="9.5"  data-i="4.2"  data-n="1800" data-t="40">⚡ VOLT DROP</button>
+            <button class="preset-btn" data-v="12.0" data-i="2.0"  data-n="2000" data-t="66">⚡ OVERHEAT</button>
+            <button class="preset-btn" data-v="12.0" data-i="2.0"  data-n="2000" data-t="79">⚡ THERMAL RUNAWAY</button>
+            <button class="preset-btn" data-v="12.0" data-i="6.0"  data-n="2000" data-t="38">⚡ HIGH CURRENT</button>
+          </div>
+          <div class="si-inject-row">
+            <button id="btn-inject" class="inject-btn">⇥ INJECT READING → POST /update</button>
+            <div id="inject-result" class="inject-result"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ TAB: FAULT DIAGNOSIS ═══ -->
+    <div id="tab-faults" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">FAULT DIAGNOSIS</span>
+        <div class="tbar-right">
+          <button class="tbar-btn active" id="btn-fault-single">SINGLE MOTOR</button>
+          <button class="tbar-btn"        id="btn-fault-fleet">FLEET WIDE</button>
+          <select id="fault-motor-select" class="tbar-select"><option value="">— SELECT MOTOR —</option></select>
+          <button class="tbar-btn"        id="btn-fault-refresh">REFRESH</button>
+        </div>
+      </div>
+
+      <div id="fault-no-sel" class="no-sel-msg">SELECT A MOTOR OR SWITCH TO FLEET VIEW</div>
+
+      <div id="fault-content" class="hidden">
+        <div id="fault-summary-banner">
+          <div class="fsb-item"><span id="fsb-total">0</span><label>ACTIVE FAULTS</label></div>
+          <div class="fsb-item"><span id="fsb-severity">—</span><label>WORST SEVERITY</label></div>
+          <div class="fsb-item"><span id="fsb-safe">—</span><label>SAFE TO RUN</label></div>
+          <div class="fsb-item fsb-action"><span id="fsb-action">—</span></div>
+        </div>
+
+        <div id="fault-live-readings">
+          <div class="flr-item"><span id="flr-v">—</span><label>VOLTAGE (V)</label></div>
+          <div class="flr-item"><span id="flr-i">—</span><label>CURRENT (A)</label></div>
+          <div class="flr-item"><span id="flr-n">—</span><label>SPEED (RPM)</label></div>
+          <div class="flr-item"><span id="flr-t">—</span><label>SHELL °C</label></div>
+          <div class="flr-item"><span id="flr-tw">—</span><label>WINDING °C</label></div>
+          <div class="flr-item"><span id="flr-eff">—</span><label>EFFICIENCY %</label></div>
+        </div>
+
+        <div id="fault-cards-area"></div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: CONFIGURATION ═══ -->
+    <div id="tab-config" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">MOTOR CONFIGURATION</span>
+        <div class="tbar-right">
+          <label>MOTOR:</label>
+          <select id="cfg-motor-select"><option value="">— SELECT —</option></select>
+          <button class="tbar-btn" id="btn-cfg-load">LOAD CONFIG</button>
+          <button class="tbar-btn danger-btn" id="btn-cfg-reset">⟲ RESET DEFAULTS</button>
+        </div>
+      </div>
+
+      <div id="cfg-no-motor" class="no-sel-msg">SELECT A MOTOR TO VIEW & EDIT CONFIGURATION</div>
+
+      <div id="cfg-content" class="hidden">
+        <div class="cfg-section-hdr">🔒 MOTOR CONSTANTS — ENGINEER-ONLY (READ-ONLY)</div>
+        <div id="cfg-constants-grid" class="cfg-constants"></div>
+
+        <div class="cfg-section-hdr" style="margin-top:18px">
+          ⚙ OPERATOR THRESHOLDS
+          <small>— edit and apply below; values outside SAFETY_BOUNDS are rejected by server</small>
+          <span class="modified-badge hidden" id="cfg-modified-badge">MODIFIED</span>
+        </div>
+        <div id="cfg-thresholds-grid" class="cfg-thresholds"></div>
+
+        <div id="cfg-actions">
+          <button id="btn-cfg-apply" class="cfg-apply-btn">⇥ APPLY CHANGES → PATCH /motor/{id}/config</button>
+          <div id="cfg-apply-result"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: HISTORY ═══ -->
+    <div id="tab-history" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">HISTORICAL DATA</span>
+        <div class="tbar-right">
+          <label>MOTOR:</label>
+          <select id="hist-motor-select"><option value="">— SELECT —</option></select>
+          <label>HOURS:</label>
+          <select id="hist-hours">
+            <option value="1">1h</option>
+            <option value="6">6h</option>
+            <option value="12">12h</option>
+            <option value="24">24h</option>
+          </select>
+          <button class="tbar-btn" id="btn-hist-load">LOAD HISTORY</button>
+        </div>
+      </div>
+
+      <div id="hist-no-motor" class="no-sel-msg">SELECT A MOTOR AND CLICK LOAD — REQUIRES DATABASE_URL ON BACKEND</div>
+
+      <div id="hist-content" class="hidden">
+        <div id="hist-tabs">
+          <button class="htab active" data-htab="sensors">SENSOR READINGS</button>
+          <button class="htab" data-htab="faults">FAULT EVENTS</button>
+          <button class="htab" data-htab="commands">COMMAND AUDIT</button>
+        </div>
+
+        <div id="htab-sensors" class="htabpane">
+          <div id="hist-sensor-meta" class="hist-meta"></div>
+          <div class="hist-table-wrap"><table id="hist-sensor-table">
+            <thead><tr>
+              <th>TIMESTAMP</th><th>V</th><th>A</th><th>RPM</th>
+              <th>°C SHELL</th><th>EFF%</th><th>P_IN W</th><th>P_MECH W</th><th>HEALTH</th>
+            </tr></thead>
+            <tbody id="hist-sensor-body"></tbody>
+          </table></div>
+        </div>
+
+        <div id="htab-faults" class="htabpane hidden">
+          <div class="hist-table-wrap"><table id="hist-fault-table">
+            <thead><tr><th>TIMESTAMP</th><th>FAULT TYPE</th><th>SEVERITY</th><th>DETAILS</th></tr></thead>
+            <tbody id="hist-fault-body"></tbody>
+          </table></div>
+        </div>
+
+        <div id="htab-commands" class="htabpane hidden">
+          <div class="hist-table-wrap"><table id="hist-cmd-table">
+            <thead><tr><th>TIMESTAMP</th><th>COMMAND</th><th>STATUS</th></tr></thead>
+            <tbody id="hist-cmd-body"></tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ TAB: FAULT CATALOGUE ═══ -->
+    <div id="tab-catalogue" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">FAULT REFERENCE CATALOGUE</span>
+        <span class="ttl-sub">GET /fault/catalogue — complete engineering reference for all 8 detectable faults</span>
+      </div>
+      <div id="catalogue-loading" class="no-sel-msg">LOADING CATALOGUE...</div>
+      <div id="catalogue-grid" class="hidden"></div>
+    </div>
+
+    <!-- ═══ TAB: ESP32 ═══ -->
+    <div id="tab-esp32" class="tabpane hidden">
+      <div class="tab-toolbar">
+        <span class="ttl">ESP32 INTERFACE & SYSTEM</span>
+        <div class="tbar-right">
+          <label>MOTOR:</label>
+          <select id="esp-motor-select"><option value="">— SELECT —</option></select>
+        </div>
+      </div>
+
+      <div id="esp-content">
+
+        <div class="esp-grid">
+
+          <div class="esp-section">
+            <div class="esp-sec-hdr">📡 COMMAND POLLING — GET /motor/{id}/command</div>
+            <p class="esp-desc">The ESP32 polls this endpoint to retrieve its next queued command. Click to simulate a firmware poll call.</p>
+            <button class="tbar-btn" id="btn-poll-cmd">POLL NEXT COMMAND</button>
+            <pre id="esp-cmd-result" class="esp-pre">—</pre>
+          </div>
+
+          <div class="esp-section">
+            <div class="esp-sec-hdr">📊 SYSTEM STATS — GET /stats</div>
+            <p class="esp-desc">Fleet-level statistics: total, running, idle, fault, connected counts plus fault summary by type.</p>
+            <button class="tbar-btn" id="btn-stats">LOAD STATS</button>
+            <pre id="stats-result" class="esp-pre">—</pre>
+          </div>
+
+          <div class="esp-section">
+            <div class="esp-sec-hdr">🔗 FLEET CONNECTIONS — GET /fleet/connections</div>
+            <p class="esp-desc">Live ESP32 connection status per motor: CONNECTED / TIMEOUT / NEVER_CONNECTED</p>
+            <button class="tbar-btn" id="btn-fleet-conns">REFRESH CONNECTIONS</button>
+            <div id="fleet-conn-grid"></div>
+          </div>
+
+          <div class="esp-section">
+            <div class="esp-sec-hdr">♥ SYSTEM HEALTH — GET /health</div>
+            <p class="esp-desc">Backend health check: API status, cache backend, database connectivity, motor count.</p>
+            <button class="tbar-btn" id="btn-esp-health">CHECK HEALTH</button>
+            <pre id="health-result" class="esp-pre">—</pre>
+          </div>
+
+        </div>
+
+        <div class="esp-section" style="margin-top:16px">
+          <div class="esp-sec-hdr">📋 FIRMWARE INTEGRATION REFERENCE</div>
+          <div class="fw-ref">
+            <div class="fw-ref-item">
+              <b>Poll Commands</b>
+              <code>GET /motor/{id}/command</code>
+              <small>Call at 500ms–2s interval. Returns next queued command or NONE.</small>
+            </div>
+            <div class="fw-ref-item">
+              <b>Push Sensor Data</b>
+              <code>POST /update</code>
+              <small>JSON body: {"motor_id", "voltage", "current", "speed", "temperature"}</small>
+            </div>
+            <div class="fw-ref-item">
+              <b>Connection Timeout</b>
+              <code>3 seconds</code>
+              <small>Motor marked TIMEOUT if no /update call within window.</small>
+            </div>
+            <div class="fw-ref-item">
+              <b>Valid Sensor Ranges</b>
+              <code>V: 0–20 | A: 0–15 | RPM: 0–3500 | °C: −10–120</code>
+              <small>Inputs are clamped server-side. Shell temperature only — not winding.</small>
+            </div>
+            <div class="fw-ref-item">
+              <b>Auto-Stop Faults</b>
+              <code>STALL | THERMAL_RUNAWAY | WINDING_SHORT</code>
+              <small>CRITICAL faults trigger immediate state→FAULT. Requires power cycle to recover.</small>
+            </div>
+            <div class="fw-ref-item">
+              <b>API Docs</b>
+              <code id="fw-apidocs-link">http://localhost:8000/docs</code>
+              <small>Swagger UI with full endpoint documentation and interactive testing.</small>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+</div>
+
+<!-- ═══════ TOAST AREA ═══════ -->
+<div id="toast-area"></div>
+
+<!-- ═══════ FLEET OP RESULT MODAL ═══════ -->
+<div id="fleet-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-hdr" id="modal-title">FLEET OPERATION RESULT</div>
+    <div class="modal-body" id="modal-body"></div>
+    <button class="modal-close" id="modal-close">✕ CLOSE</button>
+  </div>
+</div>
+
+<!-- ═══════ CONFIRM MODAL ═══════ -->
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-box modal-sm">
+    <div class="modal-hdr" id="confirm-title">CONFIRM ACTION</div>
+    <div class="modal-body" id="confirm-body"></div>
+    <div class="confirm-btns">
+      <button class="confirm-yes" id="confirm-yes">✓ CONFIRM</button>
+      <button class="confirm-no"  id="confirm-no">✕ CANCEL</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
