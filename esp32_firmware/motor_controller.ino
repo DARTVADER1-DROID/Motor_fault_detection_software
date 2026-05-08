@@ -70,14 +70,14 @@ const char* MOTOR_ID = "MOTOR-01";
 // Local PC  : "http://192.168.1.100:8000"    → set USE_HTTPS 0
 // Railway   : "https://your-app.railway.app" → set USE_HTTPS 1
 // No trailing slash.
-const char* BACKEND_HOST = "http://192.168.1.100:8000";
+const char* BACKEND_HOST = "https://motorfaultdetectionsoftware-production.up.railway.app";
 
 // ── HTTPS ────────────────────────────────────────────────────────
 // 0 = plain HTTP  (local PC / LAN)
 // 1 = HTTPS       (Railway or any TLS-enabled server)
 // When USE_HTTPS=1 certificate is not verified (setInsecure).
 // Suitable for Railway public certs.
-#define USE_HTTPS 0
+#define USE_HTTPS 1
 
 // ── Polling & Timing (milliseconds) ─────────────────────────────
 const unsigned long SENSOR_INTERVAL_MS   = 500;   // Send sensor data to backend
